@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "CKDNutri-assessment-mcp"
+version = "0.3.0"
+description = "P4 评估计算域——eGFR+CKD分期+风险引擎（纯函数）"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0",
+    "pydantic>=2",
+    "a207-policy==0.3.0",
+]
+
+[project.scripts]
+CKDNutri-assessment-mcp = "CKDNutri_assessment_mcp.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
