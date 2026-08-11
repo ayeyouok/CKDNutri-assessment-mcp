@@ -63,6 +63,10 @@ def _pcr_to_a(upcr_mg_g: float) -> str:
 
 
 def _schwartz_k(age_years: float, k_value: Optional[float]) -> float:
+    """Schwartz 经典 k 值：<1yr=0.45, 1-12yr=0.55, ≥13yr=0.70。
+    注：早产儿（<37周）理论上需 0.33，本函数暂不内置早产判定（需调用方传入 is_preterm
+    并自行调整 k_value），<1yr 默认使用足月儿 0.45。
+    """
     if k_value is not None:
         return float(k_value)
     if age_years < 1:
@@ -85,12 +89,15 @@ def calc_egfr_schwartz(
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     返回：egfr(ml/min/1.73m²)、method、formula(所用公式串)、note(警示/口径)。
     """
-    caller = get_caller()
     enforce_read(MCP_NAME)
+    if age_years < 0:
+        raise ValueError("age_years 不能为负")
     if height_cm <= 0:
         raise ValueError("height_cm 必须 > 0")
     if serum_creatinine_mgdl <= 0:
         raise ValueError("serum_creatinine_mgdl 必须 > 0")
+    if method == "revised2009" and (bun_mg_dl is None or bun_mg_dl <= 0):
+        raise ValueError("revised2009 需要 bun_mg_dl > 0")
 
     if method == "classic":
         k = _schwartz_k(age_years, k_value)
@@ -108,7 +115,7 @@ def calc_egfr_schwartz(
         note = "含 BUN 修订 Schwartz 2009，对 eGFR<60 的儿童更准确。"
     else:  # bedside2009
         egfr = _BEDSIDE_K * height_cm / serum_creatinine_mgdl
-        formula = "eGFR = 0.413×height/Sr"
+        formula = "eGFR = 0.413×height/Scr"
         note = "床旁 Schwartz 2009（KDIGO 推荐默认式）。"
 
     egfr = round(egfr, 1)
@@ -137,7 +144,6 @@ def classify_ckd(
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     egfr 必需；白蛋白尿二选一（uacr 或 upcr）。返回 g、a、stage(GxAx)、description、risk_note。
     """
-    caller = get_caller()
     enforce_read(MCP_NAME)
     if egfr < 0:
         raise ValueError("egfr 必须 >= 0")
@@ -200,8 +206,17 @@ _RULES: Optional[Dict[str, Any]] = None
 def _load_rules() -> Dict[str, Any]:
     global _RULES
     if _RULES is None:
-        with open(_RULES_PATH, "r", encoding="utf-8") as f:
-            _RULES = json.load(f)
+        try:
+            with open(_RULES_PATH, "r", encoding="utf-8") as f:
+                _RULES = json.load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"风险规则文件缺失：{_RULES_PATH}；请确认 data/rules.json 存在"
+            )
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"风险规则文件 JSON 解析失败：{_RULES_PATH}，{e}"
+            )
     return _RULES
 
 
@@ -255,8 +270,11 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
                 hit = rule["low_pct"] <= pct < rule["high_pct"]
             else:
                 hit = pct >= rule["threshold_pct"]
-        else:  # down
-            hit = pct <= -rule["threshold_pct"]
+        else:  # down：同样支持区间型（如"下降 30%–50%"）
+            if "low_pct" in rule:
+                hit = -rule["high_pct"] < pct <= -rule["low_pct"]
+            else:
+                hit = pct <= -rule["threshold_pct"]
         if not hit:
             return None
         return {
@@ -289,7 +307,6 @@ def evaluate_risk_rules(
       prior_comparison: {prior_level, current_level, delta_note}
       level_correction_applied: True（声明范式已执行）
     """
-    caller = get_caller()
     rules_doc = _load_rules()
     matched: List[Dict[str, Any]] = []
     for rule in rules_doc["rules"]:
@@ -336,7 +353,6 @@ def evaluate_risk_rules(
 
 def list_rules() -> List[Dict[str, Any]]:
     """返回规则清单（不含评估逻辑）。"""
-    caller = get_caller()
     rules_doc = _load_rules()
     out = []
     for r in rules_doc["rules"]:
@@ -356,7 +372,6 @@ def list_rules() -> List[Dict[str, Any]]:
 
 def explain_verdict(evaluation: Dict[str, Any]) -> List[Dict[str, Any]]:
     """把 evaluate_risk_rules 的结果翻成判定链路，供审计与医生复核。"""
-    caller = get_caller()
     chain = []
     for m in evaluation["matched_rules"]:
         chain.append({
@@ -378,20 +393,64 @@ def explain_verdict(evaluation: Dict[str, Any]) -> List[Dict[str, Any]]:
 # DAG: assess_clinical_status (v2.2/v2.3)
 # ================================================================
 
-def assess_clinical_status(age_years,height_cm,serum_creatinine_mgdl,
-    uacr_mg_g=None,upcr_mg_g=None,bun_mg_dl=None,k_value=None,
-    new_labs=None,prior_labs=None,prior_level=None):
-    caller=get_caller(); enforce_read(MCP_NAME)
-    egfr_r=calc_egfr_schwartz(age_years,height_cm,serum_creatinine_mgdl,method="bedside2009",bun_mg_dl=bun_mg_dl,k_value=k_value)
-    ckd_r=classify_ckd(egfr=egfr_r["egfr"],uacr_mg_g=uacr_mg_g,upcr_mg_g=upcr_mg_g)
-    risk_r={};
+def assess_clinical_status(
+    age_years: float,
+    height_cm: float,
+    serum_creatinine_mgdl: float,
+    uacr_mg_g: Optional[float] = None,
+    upcr_mg_g: Optional[float] = None,
+    bun_mg_dl: Optional[float] = None,
+    k_value: Optional[float] = None,
+    new_labs: Optional[Dict[str, float]] = None,
+    prior_labs: Optional[Dict[str, float]] = None,
+    prior_level: Optional[str] = None,
+) -> Dict[str, Any]:
+    """一键评估 CKD 临床状态（eGFR + 分期 + 风险评分 DAG）。
+
+    身份来自部署注入的环境变量 A207_CALLER（P0-1）。
+    如果提供了 bun_mg_dl 则自动使用 revised2009 修订公式；若显式传入 k_value 则切换经典公式。
+    """
+    enforce_read(MCP_NAME)
+
+    # 自动识别 Schwartz 方法
+    method: EgfrMethod = "bedside2009"
+    if bun_mg_dl is not None:
+        method = "revised2009"
+    elif k_value is not None:
+        method = "classic"
+
+    egfr_r = calc_egfr_schwartz(
+        age_years=age_years,
+        height_cm=height_cm,
+        serum_creatinine_mgdl=serum_creatinine_mgdl,
+        method=method,
+        bun_mg_dl=bun_mg_dl,
+        k_value=k_value,
+    )
+    ckd_r = classify_ckd(
+        egfr=egfr_r["egfr"],
+        uacr_mg_g=uacr_mg_g,
+        upcr_mg_g=upcr_mg_g,
+    )
+    risk_r: Dict[str, Any] = {}
     if new_labs:
-        labs=dict(new_labs); labs.setdefault("egfr",egfr_r["egfr"])
-        risk_r=evaluate_risk_rules(new_labs=labs,prior_labs=prior_labs,prior_level=prior_level)
-    return {"ok":True,
-        "egfr":egfr_r["egfr"],"egfr_unit":egfr_r["unit"],"egfr_method":egfr_r["method"],
-        "ckd_stage":ckd_r["stage"],"ckd_g_stage":ckd_r["g"],"ckd_a_stage":ckd_r.get("a"),
-        "risk_level":risk_r.get("overall_level","none") if risk_r else "none",
-        "risk_matched_rules":risk_r.get("matched_rules",[]) if risk_r else []}
+        labs = dict(new_labs)
+        labs.setdefault("egfr", egfr_r["egfr"])
+        risk_r = evaluate_risk_rules(
+            new_labs=labs,
+            prior_labs=prior_labs,
+            prior_level=prior_level,
+        )
+    return {
+        "ok": True,
+        "egfr": egfr_r["egfr"],
+        "egfr_unit": egfr_r["unit"],
+        "egfr_method": egfr_r["method"],
+        "ckd_stage": ckd_r["stage"],
+        "ckd_g_stage": ckd_r["g"],
+        "ckd_a_stage": ckd_r.get("a"),
+        "risk_level": risk_r.get("overall_level", "none") if risk_r else "none",
+        "risk_matched_rules": risk_r.get("matched_rules", []) if risk_r else [],
+    }
 
 # ---- M8: risk rules engine ----
