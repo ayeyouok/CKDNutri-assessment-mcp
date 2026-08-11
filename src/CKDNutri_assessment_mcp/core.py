@@ -109,8 +109,7 @@ def calc_egfr_schwartz(
         formula = f"eGFR = k×height/Scr, k={k}"
         note = "经典 k 值 Schwartz；k 默认按年龄带（<1y=0.45, 1-12y=0.55, ≥13y=0.70），可被 k_value 覆盖。"
     elif method == "revised2009":
-        if bun_mg_dl is None:
-            raise ValueError("revised2009 需要提供 bun_mg_dl")
+        # bun_mg_dl 已由前置校验保证非空 > 0，此处不再重复判定
         denom = serum_creatinine_mgdl + 0.003 * bun_mg_dl - 0.024
         if denom <= 0:
             raise ValueError("revised2009 分母非正（Scr+0.003×BUN-0.024 必须 > 0）")
@@ -422,6 +421,7 @@ def assess_clinical_status(
     upcr_mg_g: Optional[float] = None,
     bun_mg_dl: Optional[float] = None,
     k_value: Optional[float] = None,
+    method: Optional[EgfrMethod] = None,
     new_labs: Optional[Dict[str, float]] = None,
     prior_labs: Optional[Dict[str, float]] = None,
     prior_level: Optional[str] = None,
@@ -429,16 +429,19 @@ def assess_clinical_status(
     """一键评估 CKD 临床状态（eGFR + 分期 + 风险评分 DAG）。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1）。
-    如果提供了 bun_mg_dl 则自动使用 revised2009 修订公式；若显式传入 k_value 则切换经典公式。
+    method=None 时自动推理（有 bun → revised2009，有 k_value → classic，否则 bedside2009）；
+    传入 method 则优先使用传入值。
     """
     enforce_read(MCP_NAME)
 
-    # 自动识别 Schwartz 方法
-    method: EgfrMethod = "bedside2009"
-    if bun_mg_dl is not None:
-        method = "revised2009"
-    elif k_value is not None:
-        method = "classic"
+    # 自动识别 Schwartz 方法（显式传入优先）
+    if method is None:
+        if bun_mg_dl is not None:
+            method = "revised2009"
+        elif k_value is not None:
+            method = "classic"
+        else:
+            method = "bedside2009"
 
     egfr_r = calc_egfr_schwartz(
         age_years=age_years,
@@ -460,6 +463,10 @@ def assess_clinical_status(
     labs["egfr"] = egfr_r["egfr"]
     if bun_mg_dl is not None:
         labs["bun"] = bun_mg_dl
+    if uacr_mg_g is not None:
+        labs["uacr"] = uacr_mg_g
+    if upcr_mg_g is not None:
+        labs["upcr"] = upcr_mg_g
     risk_r = evaluate_risk_rules(
         new_labs=labs,
         prior_labs=prior_labs,
