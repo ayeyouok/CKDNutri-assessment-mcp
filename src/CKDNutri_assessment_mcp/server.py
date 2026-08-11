@@ -44,6 +44,7 @@ def assess_clinical_status_tool(
     upcr_mg_g: Optional[float] = None,
     bun_mg_dl: Optional[float] = None,
     k_value: Optional[float] = None,
+    method: Optional[str] = None,
     new_labs: Optional[dict] = None,
     prior_labs: Optional[dict] = None,
     prior_level: Optional[str] = None,
@@ -58,6 +59,7 @@ def assess_clinical_status_tool(
             age_years, height_cm, serum_creatinine_mgdl,
             uacr_mg_g=uacr_mg_g, upcr_mg_g=upcr_mg_g,
             bun_mg_dl=bun_mg_dl, k_value=k_value,
+            method=method,
             new_labs=new_labs, prior_labs=prior_labs, prior_level=prior_level,
         )
     except Exception as exc:

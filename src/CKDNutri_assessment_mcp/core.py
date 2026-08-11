@@ -229,6 +229,10 @@ def _load_rules() -> Dict[str, Any]:
 
 def _pct_change(new: float, old: float) -> float:
     """相对变化百分比（正=升，负=降）。old<=0 视为无效。"""
+    try:
+        new, old = float(new), float(old)
+    except (ValueError, TypeError):
+        return float("nan")
     if old is None or old <= 0:
         return float("nan")
     return (new - old) / old * 100.0
@@ -242,7 +246,10 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
     if rtype == "absolute":
         if metric not in new_labs or new_labs[metric] is None:
             return None
-        v = new_labs[metric]
+        try:
+            v = float(new_labs[metric])  # 防御 JSON 序列化字符串类型
+        except (ValueError, TypeError):
+            return None
         op = rule["operator"]
         if op == "gt":
             hit = v > rule["threshold"]
