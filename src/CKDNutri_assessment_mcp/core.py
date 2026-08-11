@@ -239,8 +239,12 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
         op = rule["operator"]
         if op == "gt":
             hit = v > rule["threshold"]
+        elif op == "gte":
+            hit = v >= rule["threshold"]
         elif op == "lt":
             hit = v < rule["threshold"]
+        elif op == "lte":
+            hit = v <= rule["threshold"]
         elif op == "between":
             low, high = rule["low"], rule["high"]
             hit = low <= v < high
@@ -272,6 +276,8 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
                 hit = pct >= rule["threshold_pct"]
         else:  # down：同样支持区间型（如"下降 30%–50%"）
             if "low_pct" in rule:
+                # 下降区间镜像上升 [low, high)：high 端转负后开放，low 端转负后闭合。
+                # 例 [30, 50)→(-50, -30]，即下降 30% 命中边界而 50% 不命中。
                 hit = -rule["high_pct"] < pct <= -rule["low_pct"]
             else:
                 hit = pct <= -rule["threshold_pct"]
@@ -441,7 +447,8 @@ def assess_clinical_status(
     risk_r: Dict[str, Any] = {}
     if new_labs:
         labs = dict(new_labs)
-        labs.setdefault("egfr", egfr_r["egfr"])
+        # 强制使用本轮最新 eGFR（setdefault 不会覆盖旧值，导致规则引擎用旧数据）
+        labs["egfr"] = egfr_r["egfr"]
         risk_r = evaluate_risk_rules(
             new_labs=labs,
             prior_labs=prior_labs,
