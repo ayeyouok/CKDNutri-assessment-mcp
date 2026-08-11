@@ -90,6 +90,10 @@ def calc_egfr_schwartz(
     返回：egfr(ml/min/1.73m²)、method、formula(所用公式串)、note(警示/口径)。
     """
     enforce_read(MCP_NAME)
+    if method not in ("bedside2009", "revised2009", "classic"):
+        raise ValueError(
+            f"无效的 method: '{method}'，必须为 bedside2009 / revised2009 / classic 之一"
+        )
     if age_years < 0:
         raise ValueError("age_years 不能为负")
     if height_cm <= 0:
@@ -147,6 +151,10 @@ def classify_ckd(
     enforce_read(MCP_NAME)
     if egfr < 0:
         raise ValueError("egfr 必须 >= 0")
+    if uacr_mg_g is not None and uacr_mg_g < 0:
+        raise ValueError("uacr_mg_g 不能为负")
+    if upcr_mg_g is not None and upcr_mg_g < 0:
+        raise ValueError("upcr_mg_g 不能为负")
 
     g = _egfr_to_g(egfr)
     a: Optional[str] = None
@@ -252,11 +260,12 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
             hit = False
         if not hit:
             return None
+        op_label = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}.get(op, op)
         return {
             "metric": metric,
             "observed": v,
             "threshold": (rule.get("low"), rule.get("high")) if op == "between"
-                         else rule.get("threshold"),
+                         else f"{op_label} {rule['threshold']}",
             "unit": rule["unit"],
         }
     if rtype == "trend_pct":
@@ -335,10 +344,10 @@ def evaluate_risk_rules(
             "unit": detail["unit"],
         })
 
-    # 最高等级
+    # 最高等级（防御性读取：rules.json 中未知等级默认 rank=0，不抛 KeyError）
     overall = "none"
     for m in matched:
-        if _LEVEL_RANK[m["level"]] > _LEVEL_RANK[overall]:
+        if _LEVEL_RANK.get(m["level"], 0) > _LEVEL_RANK.get(overall, 0):
             overall = m["level"]
 
     # 对比：仅展示，不兜底
@@ -445,15 +454,17 @@ def assess_clinical_status(
         upcr_mg_g=upcr_mg_g,
     )
     risk_r: Dict[str, Any] = {}
-    if new_labs:
-        labs = dict(new_labs)
-        # 强制使用本轮最新 eGFR（setdefault 不会覆盖旧值，导致规则引擎用旧数据）
-        labs["egfr"] = egfr_r["egfr"]
-        risk_r = evaluate_risk_rules(
-            new_labs=labs,
-            prior_labs=prior_labs,
-            prior_level=prior_level,
-        )
+    # 始终以本轮计算的 eGFR + 已传入参数打底做风险评估，不因未传 new_labs 而静默跳过
+    labs = dict(new_labs) if new_labs else {}
+    labs["scr"] = serum_creatinine_mgdl
+    labs["egfr"] = egfr_r["egfr"]
+    if bun_mg_dl is not None:
+        labs["bun"] = bun_mg_dl
+    risk_r = evaluate_risk_rules(
+        new_labs=labs,
+        prior_labs=prior_labs,
+        prior_level=prior_level,
+    )
     return {
         "ok": True,
         "egfr": egfr_r["egfr"],
