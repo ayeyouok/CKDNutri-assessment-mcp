@@ -125,20 +125,10 @@ def list_rules_tool() -> dict[str, Any]:
 
 
 @mcp.tool
-def explain_verdict_tool(
-    prior_level: Optional[str] = None,
-    matched_rules: Optional[list] = None,
-    applied_correction: Optional[str] = None,
-    correction_reason: Optional[str] = None,
-) -> dict[str, Any]:
-    """解释某次风险判定链路（命中了哪条规则、为什么定级 Lx）。"""
+def explain_verdict_tool(evaluation: dict) -> dict[str, Any]:
+    """把 evaluate_risk_rules 的返回翻成判定链路（哪条规则、哪个数值、什么阈值），供审计与医生复核。"""
     try:
-        return explain_verdict(
-            prior_level=prior_level,
-            matched_rules=matched_rules,
-            applied_correction=applied_correction,
-            correction_reason=correction_reason,
-        )
+        return {"chain": explain_verdict(evaluation)}
     except Exception as exc:
         return _invalid(exc)
 
