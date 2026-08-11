@@ -277,11 +277,16 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
                 hit = pct <= -rule["threshold_pct"]
         if not hit:
             return None
+        # 生成阈值描述：区间型用 low_pct/high_pct，单阈值型用 threshold_pct
+        if "low_pct" in rule:
+            thresh_str = (f"{direction} [{rule['low_pct']}%, {rule['high_pct']}%)")
+        else:
+            thresh_str = (f">= {rule['threshold_pct']}%" if direction == "up"
+                          else f"<= -{rule['threshold_pct']}%")
         return {
             "metric": metric,
             "observed": round(pct, 1),
-            "threshold": (f">= {rule['threshold_pct']}%" if direction == "up"
-                          else f"<= -{rule['threshold_pct']}%"),
+            "threshold": thresh_str,
             "unit": "%",
         }
     return None
@@ -299,7 +304,7 @@ def evaluate_risk_rules(
                 支持键：scr(mg/dL), k, p, hb(g/L), ca, ua(umol/L), egfr(ml/min/1.73m^2)
       prior_labs: 上轮同指标值（用于趋势类规则：R-01/R-08 肌酐、R-07 eGFR）。缺则趋势规则不触发。
       prior_level: 历史系统等级（L1/L2/L3）。**仅作对比输出，绝不兜底**。
-      caller: 内部形参，缺省由部署注入的 A207_CALLER 解析（P0-1：模型不可自证身份）。
+      身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
 
     返回：
       matched_rules: 命中规则明细列表
@@ -307,6 +312,7 @@ def evaluate_risk_rules(
       prior_comparison: {prior_level, current_level, delta_note}
       level_correction_applied: True（声明范式已执行）
     """
+    enforce_read(MCP_NAME)
     rules_doc = _load_rules()
     matched: List[Dict[str, Any]] = []
     for rule in rules_doc["rules"]:
@@ -365,7 +371,7 @@ def list_rules() -> List[Dict[str, Any]]:
         else:
             entry["criterion"] = (f"{r['direction']} {r.get('threshold_pct', '')}%"
                                   if "low_pct" not in r
-                                  else f"up [{r['low_pct']}, {r['high_pct']})%")
+                                  else f"{r['direction']} [{r['low_pct']}, {r['high_pct']})%")
         out.append(entry)
     return out
 

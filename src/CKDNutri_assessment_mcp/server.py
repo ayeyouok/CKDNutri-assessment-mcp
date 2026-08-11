@@ -116,10 +116,10 @@ def evaluate_risk_rules_tool(
 
 
 @mcp.tool
-def list_rules_tool() -> list[dict[str, Any]]:
+def list_rules_tool() -> dict[str, Any]:
     """列出所有活跃风险规则及其阈值。"""
     try:
-        return list_rules()
+        return {"ok": True, "rules": list_rules()}
     except Exception as exc:
         return _invalid(exc)
 
