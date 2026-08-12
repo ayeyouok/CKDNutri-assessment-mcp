@@ -59,8 +59,8 @@ def assess_clinical_status_tool(
     bun_mg_dl: Optional[float] = None,
     k_value: Optional[float] = None,
     method: Optional[str] = None,
-    new_labs: Optional[dict] = None,
-    prior_labs: Optional[dict] = None,
+    new_labs: Optional[dict[str, float]] = None,
+    prior_labs: Optional[dict[str, float]] = None,
     prior_level: Optional[str] = None,
 ) -> dict[str, Any]:
     """一键评估：eGFR→CKD 分期→风险等级 完整链路。
@@ -126,8 +126,8 @@ def classify_ckd_tool(
 
 
 def evaluate_risk_rules_tool(
-    new_labs: dict,
-    prior_labs: Optional[dict] = None,
+    new_labs: dict[str, float],
+    prior_labs: Optional[dict[str, float]] = None,
     prior_level: Optional[str] = None,
 ) -> dict[str, Any]:
     """[内部] 重评儿童 CKD 风险（L1/L2/L3 + 命中规则清单）。非 MCP 工具。"""

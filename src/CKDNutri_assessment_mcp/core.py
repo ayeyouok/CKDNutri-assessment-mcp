@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 
 from typing import Any, Dict, List, Literal, Optional
@@ -98,15 +99,23 @@ def calc_egfr_schwartz(
         raise ValueError(
             f"无效的 method: '{method}'，必须为 bedside2009 / revised2009 / classic 之一"
         )
+    # BUG-58：显式拒绝 NaN/Inf 入参（NaN 身高/肌酐会算出 NaN eGFR，再被 classify_ckd 静默归 G5）
+    age_years = _require_finite(age_years, "age_years")
+    height_cm = _require_finite(height_cm, "height_cm")
     if age_years < 0:
         raise ValueError("age_years 不能为负")
     if height_cm <= 0:
         raise ValueError("height_cm 必须 > 0")
-    scr = _normalize_scr(serum_creatinine_mgdl, serum_creatinine_unit)
+    scr = _require_finite(_normalize_scr(serum_creatinine_mgdl, serum_creatinine_unit),
+                          "serum_creatinine")
     if scr <= 0:
         raise ValueError("serum_creatinine 必须 > 0")
-    if method == "revised2009" and (bun_mg_dl is None or bun_mg_dl <= 0):
-        raise ValueError("revised2009 需要 bun_mg_dl > 0")
+    if method == "revised2009":
+        if bun_mg_dl is None:
+            raise ValueError("revised2009 需要 bun_mg_dl > 0")
+        bun_mg_dl = _require_finite(bun_mg_dl, "bun_mg_dl")
+        if bun_mg_dl <= 0:
+            raise ValueError("revised2009 需要 bun_mg_dl > 0")
 
     if method == "classic":
         k = _schwartz_k(age_years, k_value, is_preterm=is_preterm)
@@ -171,6 +180,22 @@ def _unit_label(unit: str) -> str:
     return "umol/L（已 ÷88.4 转 mg/dL）" if u in ("umol_l", "umoll", "umol") else "mg/dL"
 
 
+def _require_finite(value: Any, name: str) -> float:
+    """把输入转 float 并显式拒绝 NaN/Inf（BUG-58，2026-08-12）。
+
+    NaN 会静默穿透所有比较：`nan < 0` 为 False（绕过负数校验）、`_egfr_to_g(nan)`
+    全分支不命中最终返回 G5（肾衰竭）；`inf` 反之 `>= 90` 恒真落 G1。数值异常
+    必须显式报错，不得静默误分期（临床安全）。
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} 必须为有效数值")
+    if math.isnan(v) or math.isinf(v):
+        raise ValueError(f"{name} 必须为有效的有限数值")
+    return v
+
+
 def classify_ckd(
     egfr: float,
     uacr_mg_g: Optional[float] = None,
@@ -184,12 +209,18 @@ def classify_ckd(
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
+    # BUG-58：显式拒绝 NaN/Inf（此前 nan 绕过 <0 校验、_egfr_to_g 静默落 G5）
+    egfr = _require_finite(egfr, "egfr")
     if egfr < 0:
         raise ValueError("egfr 必须 >= 0")
-    if uacr_mg_g is not None and uacr_mg_g < 0:
-        raise ValueError("uacr_mg_g 不能为负")
-    if upcr_mg_g is not None and upcr_mg_g < 0:
-        raise ValueError("upcr_mg_g 不能为负")
+    if uacr_mg_g is not None:
+        uacr_mg_g = _require_finite(uacr_mg_g, "uacr_mg_g")
+        if uacr_mg_g < 0:
+            raise ValueError("uacr_mg_g 不能为负")
+    if upcr_mg_g is not None:
+        upcr_mg_g = _require_finite(upcr_mg_g, "upcr_mg_g")
+        if upcr_mg_g < 0:
+            raise ValueError("upcr_mg_g 不能为负")
 
     g = _egfr_to_g(egfr)
     a: Optional[str] = None
@@ -219,11 +250,15 @@ def classify_ckd(
         "G4": "eGFR 15–29，重度下降",
         "G5": "eGFR < 15，肾衰竭",
     }[g]
-    a_desc = {
-        "A1": "白蛋白尿正常-轻度增高",
-        "A2": "白蛋白尿中度增高",
-        "A3": "白蛋白尿重度增高",
-    }
+    a_desc = None
+    if a is not None:
+        # BUG-67 后补（2026-08-12）：a_desc 仅当 a 已判定时构建——a=None（仅 UPCR 时）
+        # 无需白蛋白尿描述字典，移入分支内代码更清爽（行为不变）。
+        a_desc = {
+            "A1": "白蛋白尿正常-轻度增高",
+            "A2": "白蛋白尿中度增高",
+            "A3": "白蛋白尿重度增高",
+        }
 
     risk_note = _risk_note(g, a)
 
@@ -235,7 +270,7 @@ def classify_ckd(
             "g": g,
             "a": a,
             "g_description": g_desc,
-            "a_description": a_desc.get(a) if a else None,
+            "a_description": a_desc.get(a) if a is not None and a_desc else None,
             "albuminuria_source": albuminuria_source or None,
             "albuminuria_note": albuminuria_note,
             "risk_note": risk_note,
@@ -249,10 +284,17 @@ def _risk_note(g: str, a: Optional[str]) -> str:
     a_rank = {"A1": 0, "A2": 1, "A3": 2}.get(a or "A1", 0)
     score = g_rank + a_rank
     if score >= 6:
-        return "进展风险高：建议缩短随访间隔（如 1–3 个月）并由肾科密切管理。"
-    if score >= 3:
-        return "进展风险中等：建议 3–6 个月随访一次。"
-    return "进展风险低：建议 6–12 个月常规随访。"
+        note = "进展风险高：建议缩短随访间隔（如 1–3 个月）并由肾科密切管理。"
+    elif score >= 3:
+        note = "进展风险中等：建议 3–6 个月随访一次。"
+    else:
+        note = "进展风险低：建议 6–12 个月常规随访。"
+    # BUG-58（2026-08-12）：a=None（未提供 UACR / 仅提供 UPCR）时评分按无白蛋白尿计，
+    # 可能低估进展风险——显式注明白蛋白尿未计入，提示补充 UACR 复评（透明，不捏造分期）。
+    if a is None:
+        note += ("（白蛋白尿 A 分期未计入评分：未提供 UACR 或仅提供 UPCR；"
+                 "实际进展风险可能更高，请补充 UACR 后复评。）")
+    return note
 _LEVEL_RANK = {"L1": 3, "L2": 2, "L3": 1, "none": 0}
 
 _RULES_PATH = os.path.join(os.path.dirname(__file__), "data", "rules.json")
@@ -277,14 +319,19 @@ def _load_rules() -> Dict[str, Any]:
 
 
 def _pct_change(new: float, old: float) -> float:
-    """相对变化百分比（正=升，负=降）。old<=0 视为无效。"""
+    """相对变化百分比（正=升，负=降）。old<=0 或任一值为 NaN/Inf 视为无效。
+
+    BUG-58（2026-08-12）：原 `old is None` 判断位于 float(old) 之后属死代码
+    （None 会在 float() 抛 TypeError 提前返回）；且 NaN 穿透 `old <= 0` 比较后
+    会带着 NaN 继续计算（虽被上层 pct != pct 过滤），显式拒绝更清晰。
+    """
     try:
-        new, old = float(new), float(old)
+        n, o = float(new), float(old)
     except (ValueError, TypeError):
         return float("nan")
-    if old is None or old <= 0:
+    if math.isnan(n) or math.isnan(o) or math.isinf(n) or math.isinf(o) or o <= 0:
         return float("nan")
-    return (new - old) / old * 100.0
+    return (n - o) / o * 100.0
 
 
 def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
@@ -377,7 +424,10 @@ _LAB_ALIAS_TO_RULE: dict[str, tuple[str, float]] = {
     "na_mmol_L": ("na", 1.0),
     "ua_umol_L": ("ua", 1.0),
     "egfr_ml_min": ("egfr", 1.0),
-    "bun_mmol_L": ("bun", 1.0),
+    # BUG-58（2026-08-12）：bun 短名口径与 eGFR revised2009 公式一致为 mg/dL——
+    # P1 的 bun_mmol_L（mmol/L 尿素氮）须 ×2.8 换算，原系数 1.0 会在未来新增 bun
+    # 规则时产生 2.8 倍偏差（当前规则库尚无 bun 规则，属隐患修复）。
+    "bun_mmol_L": ("bun", 2.8),
 }
 
 
@@ -499,8 +549,15 @@ def explain_verdict(evaluation: Dict[str, Any]) -> Dict[str, Any]:
     """把 evaluate_risk_rules 的结果翻成判定链路，供审计与医生复核。
 
     入参接受 evaluate_risk_rules 的 {ok,data} 信封或直接其 data 体（向后兼容）。
+    BUG-58（2026-08-12）：显式失败信封（{ok:false}）与非 dict 入参直接拒绝——
+    此前失败信封会被误读为"无规则命中"，掩盖评估失败的事实。
     """
-    data = evaluation.get("data") if isinstance(evaluation, dict) else None
+    if not isinstance(evaluation, dict):
+        raise ValueError(f"无法解释无效的评估结果：{evaluation!r}（需要评估结果 dict）")
+    if evaluation.get("ok") is False:
+        raise ValueError(
+            f"无法解释失败的评估结果：{evaluation.get('error')} {evaluation.get('detail', '')}".strip())
+    data = evaluation.get("data")
     payload = data if isinstance(data, dict) else evaluation
     chain = []
     for m in payload.get("matched_rules", []):
@@ -574,6 +631,12 @@ def assess_clinical_status(
         k_value=k_value,
         is_preterm=is_preterm,
     )
+    # BUG-67 后补（2026-08-12）：防御性兜底——calc_egfr_schwartz 当前对非法输入抛 ValueError
+    # （冒泡到 server._invalid 归 INVALID_INPUT），但 DAG 内部直接索引 egfr_r["data"] 依赖
+    # "成功必返回 dict 信封"的隐含假设；若未来底层重构为"错误返回错误信封"而非抛异常，
+    # 此处会 KeyError。统一先判 ok 再透传，双形态兼容。
+    if not egfr_r.get("ok"):
+        return egfr_r
     ckd_r = classify_ckd(
         egfr=egfr_r["data"]["egfr"],
         uacr_mg_g=uacr_mg_g,
@@ -601,12 +664,17 @@ def assess_clinical_status(
     # labs 仅含 scr+egfr（+可选 bun/uacr/upcr），电解质/贫血规则会被静默跳过，
     # 直接返回 overall_level="none" 会给临床"已全面评估且无风险"的假象。
     rule_metrics = sorted({rule["metric"] for rule in _load_rules()["rules"]})
-    missing_metrics = sorted(set(rule_metrics) - set(labs))
+    # BUG-58（2026-08-12）：覆盖度统计须基于归一化键名——调用方传 P1 完整键名
+    # （k_mmol_L、hb_g_L 等）时，原始 labs 不含短名，直接求差集会误报"未覆盖
+    # K/Hb"，与实际已命中的规则矛盾（用户审查发现）。
+    normalized_labs = _normalize_labs(labs) or {}
+    missing_metrics = sorted(set(rule_metrics) - set(normalized_labs))
+    covered_metrics = sorted(set(rule_metrics) - set(missing_metrics))
     if missing_metrics:
         risk_completeness = {
-            "covered_metrics": sorted(set(rule_metrics) - set(missing_metrics)),
+            "covered_metrics": covered_metrics,
             "missing_metrics": missing_metrics,
-            "note": (f"本轮仅评估了 {sorted(set(rule_metrics) - set(missing_metrics))} 相关规则，"
+            "note": (f"本轮仅评估了 {covered_metrics} 相关规则，"
                      f"未覆盖指标: {missing_metrics}；如涉及电解质（K/Ca/P）或贫血（Hb）危急值，"
                      "请传入 new_labs 补充后重评，overall_level=none 不代表全面无风险。"),
         }
