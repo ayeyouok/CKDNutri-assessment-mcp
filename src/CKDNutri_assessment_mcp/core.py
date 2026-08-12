@@ -88,7 +88,10 @@ def calc_egfr_schwartz(
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     返回：egfr(ml/min/1.73m²)、method、formula(所用公式串)、note(警示/口径)。
+    BUG-34（2026-08-12）：显式取 caller 并回写审计字段（此前仅 enforce_read 内部取用，
+    调用者身份不落返回，无法追溯谁触发了计算）。
     """
+    caller = get_caller()
     enforce_read(MCP_NAME)
     if method not in ("bedside2009", "revised2009", "classic"):
         raise ValueError(
@@ -127,13 +130,18 @@ def calc_egfr_schwartz(
         "G1/G2 阈值在婴儿期需结合月龄与生长曲线解读。"
         if age_years < 2 else ""
     )
+    # BUG-15：成功返回统一 {ok, data} 信封（此前扁平结构）；BUG-34：含 caller 审计字段
     return {
-        "egfr": egfr,
-        "unit": "ml/min/1.73m2",
-        "method": method,
-        "formula": formula,
-        "pediatric_caveat": pediatric_caveat,
-        "note": note,
+        "ok": True,
+        "data": {
+            "caller": caller,
+            "egfr": egfr,
+            "unit": "ml/min/1.73m2",
+            "method": method,
+            "formula": formula,
+            "pediatric_caveat": pediatric_caveat,
+            "note": note,
+        },
     }
 
 
@@ -146,7 +154,9 @@ def classify_ckd(
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     egfr 必需；白蛋白尿二选一（uacr 或 upcr）。返回 g、a、stage(GxAx)、description、risk_note。
+    BUG-34：显式取 caller 并回写审计字段。
     """
+    caller = get_caller()
     enforce_read(MCP_NAME)
     if egfr < 0:
         raise ValueError("egfr 必须 >= 0")
@@ -184,13 +194,17 @@ def classify_ckd(
     risk_note = _risk_note(g, a)
 
     return {
-        "stage": stage,
-        "g": g,
-        "a": a,
-        "g_description": g_desc,
-        "a_description": a_desc.get(a) if a else None,
-        "albuminuria_source": albuminuria_source or None,
-        "risk_note": risk_note,
+        "ok": True,
+        "data": {
+            "caller": caller,  # BUG-34 审计字段
+            "stage": stage,
+            "g": g,
+            "a": a,
+            "g_description": g_desc,
+            "a_description": a_desc.get(a) if a else None,
+            "albuminuria_source": albuminuria_source or None,
+            "risk_note": risk_note,
+        },
     }
 
 
@@ -333,6 +347,7 @@ def evaluate_risk_rules(
       prior_comparison: {prior_level, current_level, delta_note}
       level_correction_applied: True（声明范式已执行）
     """
+    caller = get_caller()  # BUG-34：显式取 caller 回写审计字段
     enforce_read(MCP_NAME)
     rules_doc = _load_rules()
     matched: List[Dict[str, Any]] = []
@@ -367,14 +382,18 @@ def evaluate_risk_rules(
             delta_note = f"较历史等级 {prior_level} 降至 {overall}"
 
     return {
-        "matched_rules": matched,
-        "overall_level": overall,
-        "prior_comparison": {
-            "prior_level": prior_level,
-            "current_level": overall,
-            "delta_note": delta_note,
+        "ok": True,
+        "data": {
+            "caller": caller,  # BUG-34 审计字段
+            "matched_rules": matched,
+            "overall_level": overall,
+            "prior_comparison": {
+                "prior_level": prior_level,
+                "current_level": overall,
+                "delta_note": delta_note,
+            },
+            "level_correction_applied": True,
         },
-        "level_correction_applied": True,
     }
 
 
@@ -394,13 +413,18 @@ def list_rules() -> List[Dict[str, Any]]:
                                   if "low_pct" not in r
                                   else f"{r['direction']} [{r['low_pct']}, {r['high_pct']})%")
         out.append(entry)
-    return out
+    return {"ok": True, "data": {"rules": out}}
 
 
-def explain_verdict(evaluation: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """把 evaluate_risk_rules 的结果翻成判定链路，供审计与医生复核。"""
+def explain_verdict(evaluation: Dict[str, Any]) -> Dict[str, Any]:
+    """把 evaluate_risk_rules 的结果翻成判定链路，供审计与医生复核。
+
+    入参接受 evaluate_risk_rules 的 {ok,data} 信封或直接其 data 体（向后兼容）。
+    """
+    data = evaluation.get("data") if isinstance(evaluation, dict) else None
+    payload = data if isinstance(data, dict) else evaluation
     chain = []
-    for m in evaluation["matched_rules"]:
+    for m in payload.get("matched_rules", []):
         chain.append({
             "rule_id": m["id"],
             "rule_name": m["name"],
@@ -414,7 +438,7 @@ def explain_verdict(evaluation: Dict[str, Any]) -> List[Dict[str, Any]]:
         chain.append({"rule_id": "-", "rule_name": "无规则命中",
                       "level": "none", "observed": None, "threshold": None,
                       "unit": None, "why": "本轮数据未触发任何风险规则"})
-    return chain
+    return {"ok": True, "data": {"chain": chain}}
 
 # ================================================================
 # DAG: assess_clinical_status (v2.2/v2.3)
@@ -438,7 +462,12 @@ def assess_clinical_status(
     身份来自部署注入的环境变量 A207_CALLER（P0-1）。
     method=None 时自动推理（有 bun → revised2009，有 k_value → classic，否则 bedside2009）；
     传入 method 则优先使用传入值。
+    BUG-34：显式取 caller 回写审计字段。
+    BUG-35 说明（2026-08-12）：DAG 入口 enforce_read 后，内部子函数（calc_egfr_schwartz /
+    classify_ckd / evaluate_risk_rules）各自再 enforce_read——这是**有意的防御纵深**
+    （子函数可被外部直接调用，不能假设必经 DAG），重复校验为 O(1) 查矩阵，开销可忽略。
     """
+    caller = get_caller()  # BUG-34：显式取 caller 回写审计字段
     enforce_read(MCP_NAME)
 
     # 自动识别 Schwartz 方法（显式传入优先）
@@ -459,7 +488,7 @@ def assess_clinical_status(
         k_value=k_value,
     )
     ckd_r = classify_ckd(
-        egfr=egfr_r["egfr"],
+        egfr=egfr_r["data"]["egfr"],
         uacr_mg_g=uacr_mg_g,
         upcr_mg_g=upcr_mg_g,
     )
@@ -467,7 +496,7 @@ def assess_clinical_status(
     # 始终以本轮计算的 eGFR + 已传入参数打底做风险评估，不因未传 new_labs 而静默跳过
     labs = dict(new_labs) if new_labs else {}
     labs["scr"] = serum_creatinine_mgdl
-    labs["egfr"] = egfr_r["egfr"]
+    labs["egfr"] = egfr_r["data"]["egfr"]
     if bun_mg_dl is not None:
         labs["bun"] = bun_mg_dl
     if uacr_mg_g is not None:
@@ -479,16 +508,44 @@ def assess_clinical_status(
         prior_labs=prior_labs,
         prior_level=prior_level,
     )
+    risk_data = risk_r.get("data", {}) if risk_r.get("ok") else {}
+    # BUG-26 修复（2026-08-12）：显式声明本轮风险扫描的覆盖完整性——
+    # rules.json 全部规则依赖 ca/egfr/hb/k/p/scr/ua，若调用方未传 new_labs，
+    # labs 仅含 scr+egfr（+可选 bun/uacr/upcr），电解质/贫血规则会被静默跳过，
+    # 直接返回 overall_level="none" 会给临床"已全面评估且无风险"的假象。
+    rule_metrics = sorted({rule["metric"] for rule in _load_rules()["rules"]})
+    missing_metrics = sorted(set(rule_metrics) - set(labs))
+    if missing_metrics:
+        risk_completeness = {
+            "covered_metrics": sorted(set(rule_metrics) - set(missing_metrics)),
+            "missing_metrics": missing_metrics,
+            "note": (f"本轮仅评估了 {sorted(set(rule_metrics) - set(missing_metrics))} 相关规则，"
+                     f"未覆盖指标: {missing_metrics}；如涉及电解质（K/Ca/P）或贫血（Hb）危急值，"
+                     "请传入 new_labs 补充后重评，overall_level=none 不代表全面无风险。"),
+        }
+    else:
+        risk_completeness = {
+            "covered_metrics": rule_metrics,
+            "missing_metrics": [],
+            "note": "本轮已覆盖规则引擎全部依赖指标。",
+        }
     return {
         "ok": True,
-        "egfr": egfr_r["egfr"],
-        "egfr_unit": egfr_r["unit"],
-        "egfr_method": egfr_r["method"],
-        "ckd_stage": ckd_r["stage"],
-        "ckd_g_stage": ckd_r["g"],
-        "ckd_a_stage": ckd_r.get("a"),
-        "risk_level": risk_r.get("overall_level", "none") if risk_r else "none",
-        "risk_matched_rules": risk_r.get("matched_rules", []) if risk_r else [],
+        "data": {
+            "caller": caller,  # BUG-34 审计字段
+            "egfr": egfr_r["data"]["egfr"],
+            "egfr_unit": egfr_r["data"]["unit"],
+            "egfr_method": egfr_r["data"]["method"],
+            "ckd_stage": ckd_r["data"]["stage"],
+            "ckd_g_stage": ckd_r["data"]["g"],
+            "ckd_a_stage": ckd_r["data"].get("a"),
+            "risk_level": risk_data.get("overall_level", "none"),
+            "risk_matched_rules": risk_data.get("matched_rules", []),
+            # BUG-21 修复：DAG 透出历史等级对比（prior_comparison），此前被丢弃
+            "prior_comparison": risk_data.get("prior_comparison"),
+            # BUG-26 修复：风险扫描覆盖完整性声明（防"未全面评估却显示无风险"的假象）
+            "risk_completeness": risk_completeness,
+        },
     }
 
 # ---- M8: risk rules engine ----

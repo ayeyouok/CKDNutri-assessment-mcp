@@ -66,9 +66,12 @@ def assess_clinical_status_tool(
         return _invalid(exc)
 
 
-# ---- M6: eGFR & CKD 分期（保留独立工具供单点查询） ----
+# ---- M6/M8 底层拆分函数（BUG-27 修复，2026-08-12）----
+# 需求 P4 只登记 3 个工具（assess_clinical_status_tool / list_rules_tool / explain_verdict_tool），
+# calc_egfr_schwartz / classify_ckd / evaluate_risk_rules 是 DAG 的内部拆分步骤——
+# 不再注册为 @mcp.tool（此前暴露给 LLM 增加 prompt token 消耗与误调用风险，LLM 可能绕开 DAG）。
+# 函数保留在模块内供编排层/测试直接 import 调用（经 CKDNutri_assessment_mcp.core）。
 
-@mcp.tool
 def calc_egfr_schwartz_tool(
     age_years: float,
     height_cm: float,
@@ -77,7 +80,7 @@ def calc_egfr_schwartz_tool(
     bun_mg_dl: Optional[float] = None,
     k_value: Optional[float] = None,
 ) -> dict[str, Any]:
-    """估算肾小球滤过率（Schwartz 系列），CKD 临床助手独占。"""
+    """[内部] 估算肾小球滤过率（Schwartz 系列）。非 MCP 工具，供编排层 import 调用。"""
     try:
         return calc_egfr_schwartz(
             age_years, height_cm, serum_creatinine_mgdl,
@@ -87,28 +90,24 @@ def calc_egfr_schwartz_tool(
         return _invalid(exc)
 
 
-@mcp.tool
 def classify_ckd_tool(
     egfr: float,
     uacr_mg_g: Optional[float] = None,
     upcr_mg_g: Optional[float] = None,
 ) -> dict[str, Any]:
-    """KDIGO 2024 儿童 CKD 合并分期 GxA（含风险提示）。"""
+    """[内部] KDIGO 2024 儿童 CKD 合并分期 GxA（含风险提示）。非 MCP 工具。"""
     try:
         return classify_ckd(egfr=egfr, uacr_mg_g=uacr_mg_g, upcr_mg_g=upcr_mg_g)
     except Exception as exc:
         return _invalid(exc)
 
 
-# ---- M8: 风险规则引擎 ----
-
-@mcp.tool
 def evaluate_risk_rules_tool(
     new_labs: dict,
     prior_labs: Optional[dict] = None,
     prior_level: Optional[str] = None,
 ) -> dict[str, Any]:
-    """重评儿童 CKD 风险（L1/L2/L3 + 命中规则清单）。"""
+    """[内部] 重评儿童 CKD 风险（L1/L2/L3 + 命中规则清单）。非 MCP 工具。"""
     try:
         return evaluate_risk_rules(
             new_labs=new_labs, prior_labs=prior_labs, prior_level=prior_level,
@@ -121,7 +120,7 @@ def evaluate_risk_rules_tool(
 def list_rules_tool() -> dict[str, Any]:
     """列出所有活跃风险规则及其阈值。"""
     try:
-        return {"ok": True, "rules": list_rules()}
+        return list_rules()
     except Exception as exc:
         return _invalid(exc)
 
@@ -130,7 +129,7 @@ def list_rules_tool() -> dict[str, Any]:
 def explain_verdict_tool(evaluation: dict) -> dict[str, Any]:
     """把 evaluate_risk_rules 的返回翻成判定链路（哪条规则、哪个数值、什么阈值），供审计与医生复核。"""
     try:
-        return {"chain": explain_verdict(evaluation)}
+        return explain_verdict(evaluation)
     except Exception as exc:
         return _invalid(exc)
 

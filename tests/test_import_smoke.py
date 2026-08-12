@@ -30,12 +30,15 @@ def test_assess_and_explain():
         age_years=6, height_cm=115, serum_creatinine_mgdl=0.6,
         uacr_mg_g=40, new_labs={"scr": 0.6, "k": 4.5, "hb": 105}, prior_level="L2",
     )
-    assert "ckd_stage" in dag and "risk_level" in dag
+    # BUG-15：DAG 返回统一 {ok, data} 信封；BUG-21：透出 prior_comparison
+    assert dag.get("ok") is True
+    assert "ckd_stage" in dag["data"] and "risk_level" in dag["data"]
+    assert "prior_comparison" in dag["data"], "DAG 应透出 prior_comparison（BUG-21）"
 
     ev = core.evaluate_risk_rules(new_labs={"scr": 0.6, "hb": 90},
                                   prior_labs={"scr": 0.55, "hb": 105}, prior_level="L2")
     chain = core.explain_verdict(ev)
-    assert isinstance(chain, list) and len(chain) >= 1
+    assert chain.get("ok") is True and len(chain["data"]["chain"]) >= 1
 
 
 if __name__ == "__main__":
