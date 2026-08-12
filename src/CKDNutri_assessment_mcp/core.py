@@ -53,24 +53,17 @@ def _acr_to_a(uacr_mg_g: float) -> str:
     return "A3"
 
 
-def _pcr_to_a(upcr_mg_g: float) -> str:
-    """蛋白尿 A 期：UPCR mg/g（儿童常以 PCR 评估）。"""
-    if upcr_mg_g < 150:
-        return "A1"
-    if upcr_mg_g <= 500:
-        return "A2"
-    return "A3"
+def _schwartz_k(age_years: float, k_value: Optional[float], is_preterm: bool = False) -> float:
+    """Schwartz 经典 k 值：早产儿(<37周) 0.33、<1yr 足月儿 0.45、1-12yr=0.55、≥13yr=0.70。
 
-
-def _schwartz_k(age_years: float, k_value: Optional[float]) -> float:
-    """Schwartz 经典 k 值：<1yr=0.45, 1-12yr=0.55, ≥13yr=0.70。
-    注：早产儿（<37周）理论上需 0.33，本函数暂不内置早产判定（需调用方传入 is_preterm
-    并自行调整 k_value），<1yr 默认使用足月儿 0.45。
+    BUG-47（2026-08-12）：早产儿 k=0.33 正式实现——CAKUT（先天性肾发育不良）是儿童 CKD
+    首要病因，早产儿占比高；用 0.45 替代 0.33 会把 eGFR 高估约 36%（0.45/0.33），
+    可能将 G4 误判为 G3。调用方须在已知早产时传 is_preterm=True（<1yr 生效）。
     """
     if k_value is not None:
         return float(k_value)
     if age_years < 1:
-        return 0.45
+        return 0.33 if is_preterm else 0.45
     if age_years < 13:
         return 0.55
     return 0.70
@@ -83,6 +76,8 @@ def calc_egfr_schwartz(
     method: EgfrMethod = "bedside2009",
     bun_mg_dl: Optional[float] = None,
     k_value: Optional[float] = None,
+    serum_creatinine_unit: str = "mg_dL",
+    is_preterm: bool = False,
 ) -> dict:
     """估算肾小球滤过率（Schwartz 系列）。
 
@@ -90,6 +85,12 @@ def calc_egfr_schwartz(
     返回：egfr(ml/min/1.73m²)、method、formula(所用公式串)、note(警示/口径)。
     BUG-34（2026-08-12）：显式取 caller 并回写审计字段（此前仅 enforce_read 内部取用，
     调用者身份不落返回，无法追溯谁触发了计算）。
+    BUG-40（2026-08-12）：新增 serum_creatinine_unit 单位归一化——P1 clinical-data
+    `get_labs` 返回 `scr_umol_L`（µmol/L），本函数历史上只接受 mg/dL；编排层若把 P1
+    数值直接透传会错 88.4 倍（eGFR 缩小 88 倍）。现支持 unit="umol_L" 自动 ÷88.4 转
+    mg/dL（默认仍为 mg_dL，向后兼容）。也提供显式转换函数 `scr_umol_to_mgdl`。
+    BUG-47（2026-08-12）：新增 is_preterm——早产儿经典 k=0.33（仅 <1yr 生效），
+    防 eGFR 高估 36%。
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
@@ -101,26 +102,28 @@ def calc_egfr_schwartz(
         raise ValueError("age_years 不能为负")
     if height_cm <= 0:
         raise ValueError("height_cm 必须 > 0")
-    if serum_creatinine_mgdl <= 0:
-        raise ValueError("serum_creatinine_mgdl 必须 > 0")
+    scr = _normalize_scr(serum_creatinine_mgdl, serum_creatinine_unit)
+    if scr <= 0:
+        raise ValueError("serum_creatinine 必须 > 0")
     if method == "revised2009" and (bun_mg_dl is None or bun_mg_dl <= 0):
         raise ValueError("revised2009 需要 bun_mg_dl > 0")
 
     if method == "classic":
-        k = _schwartz_k(age_years, k_value)
-        egfr = k * height_cm / serum_creatinine_mgdl
+        k = _schwartz_k(age_years, k_value, is_preterm=is_preterm)
+        egfr = k * height_cm / scr
         formula = f"eGFR = k×height/Scr, k={k}"
-        note = "经典 k 值 Schwartz；k 默认按年龄带（<1y=0.45, 1-12y=0.55, ≥13y=0.70），可被 k_value 覆盖。"
+        k_note = "早产儿 k=0.33" if (is_preterm and age_years < 1) else "经典年龄带 k"
+        note = f"{k_note}；<1y=0.45, 1-12y=0.55, ≥13y=0.70，可被 k_value 覆盖。"
     elif method == "revised2009":
         # bun_mg_dl 已由前置校验保证非空 > 0，此处不再重复判定
-        denom = serum_creatinine_mgdl + 0.003 * bun_mg_dl - 0.024
+        denom = scr + 0.003 * bun_mg_dl - 0.024
         if denom <= 0:
             raise ValueError("revised2009 分母非正（Scr+0.003×BUN-0.024 必须 > 0）")
         egfr = _BEDSIDE_K * height_cm / denom
         formula = f"eGFR = 0.413×height/(Scr + 0.003×BUN − 0.024)"
         note = "含 BUN 修订 Schwartz 2009，对 eGFR<60 的儿童更准确。"
     else:  # bedside2009
-        egfr = _BEDSIDE_K * height_cm / serum_creatinine_mgdl
+        egfr = _BEDSIDE_K * height_cm / scr
         formula = "eGFR = 0.413×height/Scr"
         note = "床旁 Schwartz 2009（KDIGO 推荐默认式）。"
 
@@ -141,8 +144,31 @@ def calc_egfr_schwartz(
             "formula": formula,
             "pediatric_caveat": pediatric_caveat,
             "note": note,
+            "scr_unit_used": _unit_label(serum_creatinine_unit),
         },
     }
+
+
+def scr_umol_to_mgdl(value_umol_L: float) -> float:
+    """显式单位转换：µmol/L → mg/dL（÷88.4）。供编排层把 P1 get_labs 的
+    `scr_umol_L` 转成 P4 eGFR 公式所需单位（BUG-40）。"""
+    return float(value_umol_L) / 88.4
+
+
+def _normalize_scr(value: float, unit: str) -> float:
+    """按声明单位归一化肌酐到 mg/dL；非法单位显式报错（fail-closed）。"""
+    v = float(value)
+    u = (unit or "mg_dL").strip().lower().replace("µ", "u")
+    if u in ("mg_dl", "mgdl", "mg"):
+        return v
+    if u in ("umol_l", "umoll", "umol"):
+        return v / 88.4
+    raise ValueError(f"无效的 serum_creatinine_unit: {unit!r}，可用 mg_dL / umol_L")
+
+
+def _unit_label(unit: str) -> str:
+    u = (unit or "mg_dL").strip().lower().replace("µ", "u")
+    return "umol/L（已 ÷88.4 转 mg/dL）" if u in ("umol_l", "umoll", "umol") else "mg/dL"
 
 
 def classify_ckd(
@@ -168,12 +194,20 @@ def classify_ckd(
     g = _egfr_to_g(egfr)
     a: Optional[str] = None
     albuminuria_source = ""
+    albuminuria_note = None
     if uacr_mg_g is not None:
         a = _acr_to_a(uacr_mg_g)
         albuminuria_source = "UACR"
     elif upcr_mg_g is not None:
-        a = _pcr_to_a(upcr_mg_g)
+        # BUG-48（2026-08-12）：KDIGO 2024 白蛋白尿 A 分期**仅基于 UACR**。UPCR 反映尿总蛋白
+        # （含球蛋白），与白蛋白不等价——肾病综合征等患儿 UPCR 显著高于 UACR，直接映射
+        # 会把 A1 误判为 A2/A3。故仅提供 UPCR 时**不再映射 A 分期**（a=None），
+        # 返回明确提示，请补充 UACR 后再做白蛋白尿分期。
+        a = None
         albuminuria_source = "UPCR"
+        albuminuria_note = ("仅提供 UPCR（尿总蛋白/肌酐比）：KDIGO 2024 白蛋白尿 A 分期仅基于 "
+                            "UACR，UPCR 含球蛋白排泄、与白蛋白不等价，未映射 A1/A2/A3。"
+                            "请补充 UACR 以完成分期。")
 
     stage = f"{g}{a}" if a else g
 
@@ -203,6 +237,7 @@ def classify_ckd(
             "g_description": g_desc,
             "a_description": a_desc.get(a) if a else None,
             "albuminuria_source": albuminuria_source or None,
+            "albuminuria_note": albuminuria_note,
             "risk_note": risk_note,
         },
     }
@@ -327,6 +362,43 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
     return None
 
 
+# --- BUG-45 修复（2026-08-12）-----------------------------------------------
+# P1 clinical-data get_labs 返回**完整键名 + PCP 单位**（scr_umol_L µmol/L、k_mmol_L 等），
+# rules.json 的 metric 用**短名 + 规则单位**（scr=mg/dL、k=mmol/L、hb=g/L、ua=umol/L…）。
+# 此前引擎"不做单位换算、调用方须传规范单位"——编排层把 P1 结果直传会因键名不匹配
+# 使全部 absolute 规则静默跳过（overall_level="none" 假象），且 scr 单位差 88.4 倍。
+# 现入口统一归一化：完整键名 → 短名 + 单位换算（仅 scr_umol_L 需要 ÷88.4，其余单位一致）。
+_LAB_ALIAS_TO_RULE: dict[str, tuple[str, float]] = {
+    "scr_umol_L": ("scr", 1.0 / 88.4),   # µmol/L → mg/dL
+    "k_mmol_L": ("k", 1.0),
+    "p_mmol_L": ("p", 1.0),
+    "hb_g_L": ("hb", 1.0),
+    "ca_mmol_L": ("ca", 1.0),
+    "na_mmol_L": ("na", 1.0),
+    "ua_umol_L": ("ua", 1.0),
+    "egfr_ml_min": ("egfr", 1.0),
+    "bun_mmol_L": ("bun", 1.0),
+}
+
+
+def _normalize_labs(labs: Optional[Dict[str, float]]) -> Optional[Dict[str, float]]:
+    """把 P1 完整键名 + PCP 单位归一化为规则短名 + 规则单位（BUG-45）。
+
+    已用短名的输入原样保留；完整键名在短名缺失时转换并换算单位。
+    返回新 dict，不修改调用方对象。
+    """
+    if not labs:
+        return labs
+    out: Dict[str, float] = dict(labs)
+    for full_key, (short, factor) in _LAB_ALIAS_TO_RULE.items():
+        if full_key in out and short not in out:
+            try:
+                out[short] = float(out[full_key]) * factor
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
 def evaluate_risk_rules(
     new_labs: Dict[str, float],
     prior_labs: Optional[Dict[str, float]] = None,
@@ -335,20 +407,27 @@ def evaluate_risk_rules(
     """基于本轮新数据重评风险。
 
     入参：
-      new_labs: 本轮 M2 拉回的新化验/测量（PCP 标准单位）。
-                支持键：scr(mg/dL), k, p, hb(g/L), ca, ua(umol/L), egfr(ml/min/1.73m^2)
+      new_labs: 本轮新化验/测量。**接受两种键名**（BUG-45 归一化）：
+        - 规则短名：scr(mg/dL), k, p, hb(g/L), ca, ua(umol/L), egfr(ml/min/1.73m^2)
+        - P1 完整键名：scr_umol_L(µmol/L), k_mmol_L, p_mmol_L, hb_g_L, ca_mmol_L,
+          ua_umol_L, egfr_ml_min, na_mmol_L, bun_mmol_L —— 自动映射到短名并换算单位
+        （scr_umol_L 自动 ÷88.4 转 mg/dL；其余单位两域一致直接透传）。
       prior_labs: 上轮同指标值（用于趋势类规则：R-01/R-08 肌酐、R-07 eGFR）。缺则趋势规则不触发。
       prior_level: 历史系统等级（L1/L2/L3）。**仅作对比输出，绝不兜底**。
       身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
 
     返回：
       matched_rules: 命中规则明细列表
+
       overall_level: 最高等级（L1>L2>L3），无命中为 "none"
       prior_comparison: {prior_level, current_level, delta_note}
       level_correction_applied: True（声明范式已执行）
     """
     caller = get_caller()  # BUG-34：显式取 caller 回写审计字段
     enforce_read(MCP_NAME)
+    # BUG-45：键名 + 单位归一化（P1 完整键名/µm→mg/dL），防编排层直传静默失效
+    new_labs = _normalize_labs(new_labs) or {}
+    prior_labs = _normalize_labs(prior_labs)
     rules_doc = _load_rules()
     matched: List[Dict[str, Any]] = []
     for rule in rules_doc["rules"]:
@@ -448,6 +527,8 @@ def assess_clinical_status(
     age_years: float,
     height_cm: float,
     serum_creatinine_mgdl: float,
+    serum_creatinine_unit: str = "mg_dL",
+    is_preterm: bool = False,
     uacr_mg_g: Optional[float] = None,
     upcr_mg_g: Optional[float] = None,
     bun_mg_dl: Optional[float] = None,
@@ -462,6 +543,8 @@ def assess_clinical_status(
     身份来自部署注入的环境变量 A207_CALLER（P0-1）。
     method=None 时自动推理（有 bun → revised2009，有 k_value → classic，否则 bedside2009）；
     传入 method 则优先使用传入值。
+    serum_creatinine_unit（BUG-40 修复）：mg_dL 默认 / umol_L 自动 ÷88.4——P1 get_labs
+    返回 scr_umol_L（µmol/L），直接透传会导致 eGFR 与风险规则的 scr 判断同时错 88 倍。
     BUG-34：显式取 caller 回写审计字段。
     BUG-35 说明（2026-08-12）：DAG 入口 enforce_read 后，内部子函数（calc_egfr_schwartz /
     classify_ckd / evaluate_risk_rules）各自再 enforce_read——这是**有意的防御纵深**
@@ -469,6 +552,9 @@ def assess_clinical_status(
     """
     caller = get_caller()  # BUG-34：显式取 caller 回写审计字段
     enforce_read(MCP_NAME)
+
+    # BUG-40：DAG 内统一归一化肌酐到 mg/dL（eGFR 公式与风险规则 scr 判断共用同一值）
+    scr_mgdl = _normalize_scr(serum_creatinine_mgdl, serum_creatinine_unit)
 
     # 自动识别 Schwartz 方法（显式传入优先）
     if method is None:
@@ -482,10 +568,11 @@ def assess_clinical_status(
     egfr_r = calc_egfr_schwartz(
         age_years=age_years,
         height_cm=height_cm,
-        serum_creatinine_mgdl=serum_creatinine_mgdl,
+        serum_creatinine_mgdl=scr_mgdl,
         method=method,
         bun_mg_dl=bun_mg_dl,
         k_value=k_value,
+        is_preterm=is_preterm,
     )
     ckd_r = classify_ckd(
         egfr=egfr_r["data"]["egfr"],
@@ -495,7 +582,7 @@ def assess_clinical_status(
     risk_r: Dict[str, Any] = {}
     # 始终以本轮计算的 eGFR + 已传入参数打底做风险评估，不因未传 new_labs 而静默跳过
     labs = dict(new_labs) if new_labs else {}
-    labs["scr"] = serum_creatinine_mgdl
+    labs["scr"] = scr_mgdl
     labs["egfr"] = egfr_r["data"]["egfr"]
     if bun_mg_dl is not None:
         labs["bun"] = bun_mg_dl

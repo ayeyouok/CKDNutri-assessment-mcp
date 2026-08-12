@@ -5,6 +5,8 @@ v2.3 新增 DAG: assess_clinical_status（eGFR→分期→风险 一键判定）
 """
 from __future__ import annotations
 
+import json
+
 from typing import Any, Optional
 
 from fastmcp import FastMCP
@@ -25,7 +27,17 @@ mcp = FastMCP("CKDNutri-assessment-mcp")
 
 def _invalid(exc: Exception) -> dict[str, Any]:
     if isinstance(exc, CallerError):
-        raise
+        # BUG-54（2026-08-12）：越权/身份未解析统一返回 FORBIDDEN 信封（与 care _guard /
+        # clinical-data _guard_access 同格式），不再向上抛导致 500。此前本包 4 处裸调
+        # enforce_read 的读工具越权即 500 崩溃。PermissionDenied 带 caller/action/reason，
+        # CallerUnknown 缺字段时降级文案。
+        return {"ok": False, "error": "FORBIDDEN",
+                "detail": f"caller={getattr(exc, 'caller', '?')} 无权 {getattr(exc, 'action', 'access')}"
+                          f"（{getattr(exc, 'reason', str(exc))}）"}
+    # BUG-52（2026-08-12）：内部数据错误归 INTERNAL_ERROR，避免误归 INVALID_INPUT
+    if isinstance(exc, (FileNotFoundError, OSError, json.JSONDecodeError)):
+        return {"ok": False, "error": "INTERNAL_ERROR",
+                "detail": f"内部数据错误：{exc}"}
     return {"ok": False, "error": "INVALID_INPUT", "detail": str(exc)}
 
 
@@ -40,6 +52,8 @@ def assess_clinical_status_tool(
     age_years: float,
     height_cm: float,
     serum_creatinine_mgdl: float,
+    serum_creatinine_unit: str = "mg_dL",
+    is_preterm: bool = False,
     uacr_mg_g: Optional[float] = None,
     upcr_mg_g: Optional[float] = None,
     bun_mg_dl: Optional[float] = None,
@@ -52,11 +66,15 @@ def assess_clinical_status_tool(
     """一键评估：eGFR→CKD 分期→风险等级 完整链路。
 
     入参：患者年龄、身高、血清肌酐、可选蛋白尿/风险数据。
+    serum_creatinine_unit: mg_dL（默认）或 umol_L——P1 get_labs 返回 scr_umol_L（µmol/L），
+    传 umol_L 自动 ÷88.4 转 mg/dL（BUG-40 修复，防 88 倍误差）。
     出参：{egfr, ckd_stage, risk_level, risk_matched_rules} 全链路聚合。
     """
     try:
         return assess_clinical_status(
             age_years, height_cm, serum_creatinine_mgdl,
+            serum_creatinine_unit=serum_creatinine_unit,
+            is_preterm=is_preterm,
             uacr_mg_g=uacr_mg_g, upcr_mg_g=upcr_mg_g,
             bun_mg_dl=bun_mg_dl, k_value=k_value,
             method=method,
@@ -76,14 +94,19 @@ def calc_egfr_schwartz_tool(
     age_years: float,
     height_cm: float,
     serum_creatinine_mgdl: float,
+    serum_creatinine_unit: str = "mg_dL",
+    is_preterm: bool = False,
     method: str = "bedside2009",
     bun_mg_dl: Optional[float] = None,
     k_value: Optional[float] = None,
 ) -> dict[str, Any]:
-    """[内部] 估算肾小球滤过率（Schwartz 系列）。非 MCP 工具，供编排层 import 调用。"""
+    """[内部] 估算肾小球滤过率（Schwartz 系列）。非 MCP 工具，供编排层 import 调用。
+    serum_creatinine_unit: mg_dL / umol_L（BUG-40）；is_preterm: 早产儿 k=0.33（BUG-47）。"""
     try:
         return calc_egfr_schwartz(
             age_years, height_cm, serum_creatinine_mgdl,
+            serum_creatinine_unit=serum_creatinine_unit,
+            is_preterm=is_preterm,
             method=method, bun_mg_dl=bun_mg_dl, k_value=k_value,
         )
     except Exception as exc:
