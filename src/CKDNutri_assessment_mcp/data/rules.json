@@ -38,10 +38,10 @@
       "level": "L1",
       "type": "absolute",
       "metric": "k",
-      "operator": "gt",
+      "operator": "gte",
       "threshold": 5.5,
       "unit": "mmol/L",
-      "description": "血钾 > 5.5 mmol/L"
+      "description": "血钾 >= 5.5 mmol/L（含 5.5，KDIGO 降钾阈值；与 R-10 上界衔接，消除 5.5 边界空隙）"
     },
     {
       "id": "R-10",

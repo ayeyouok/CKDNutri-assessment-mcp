@@ -46,8 +46,13 @@ _RULE_REQUIRED_KEYS = ("id", "name", "level", "type", "metric", "unit", "descrip
 _LEVEL_RANK = {"L1": 3, "L2": 2, "L3": 1, "none": 0}
 
 
-def _egfr_to_g(egfr: float) -> str:
-    """KDIGO 2024 儿童 eGFR 分期（ml/min/1.73m2）。"""
+def _egfr_to_g(egfr: float, dialysis_mode: Optional[str] = None) -> str:
+    """KDIGO 2024 儿童 eGFR 分期（ml/min/1.73m2）。
+
+    S1 修复（2026-08-13）：支持透析患儿 G5D——KDIGO/NICE/PRNT 把透析患儿单独
+    列为 G5D（随访每月一次），与 G5（每 60 天）不同。仅当 eGFR<15（已入 G5 域）
+    且 dialysis_mode 非空/非 none 时返回 G5D；eGFR 未跌入 G5 前仍按数值分期。
+    """
     if egfr >= 90:
         return "G1"
     if egfr >= 60:
@@ -58,6 +63,8 @@ def _egfr_to_g(egfr: float) -> str:
         return "G3b"
     if egfr >= 15:
         return "G4"
+    if dialysis_mode and dialysis_mode.strip().lower() != "none":
+        return "G5D"
     return "G5"
 
 
@@ -213,11 +220,12 @@ def calc_egfr_schwartz(
         if bun_mg_dl is not None:
             note += "（提供了 BUN 但床旁式未使用，如需 BUN 修订请用 method='revised2009'）"
 
-    egfr = round(egfr, 1)
-    # 2026-08-13（二审残余风险）：round(egfr,1) 先于分期——89.96→90.0 会翻 G2→G1，
-    # 且 DAG 用同一舍入值喂 R-07。已决策保留（0.1 精度对临床分期的边界影响可接受），
-    # 在 note 显式标注舍入口径，供医生/审计知悉。
-    note += " eGFR 已四舍五入至 0.1 ml/min/1.73m2。"
+    egfr_rounded = round(egfr, 1)
+    # N1 修复（2026-08-13）：**未 round 值判级、round 值展示**——此前 round(egfr,1)
+    # 先于分期，89.96→90.0 会在边界翻 G2→G1（DAG 用同一舍入值喂 R-07 同理）。
+    # 现在返回 egfr_raw（原始，供分期/趋势规则判级）+ egfr（round 展示），
+    # 边界不再翻转；note 仍显式标注展示舍入口径供审计。
+    note += " eGFR 已四舍五入至 0.1 ml/min/1.73m2（展示值；判级使用未舍入原始值）。"
     pediatric_caveat = (
         "注意：<2 岁婴儿 eGFR 参考范围低于年长儿（正常可低至 60–90），"
         "G1/G2 阈值在婴儿期需结合月龄与生长曲线解读。"
@@ -234,7 +242,8 @@ def calc_egfr_schwartz(
         "ok": True,
         "data": {
             "caller": caller,
-            "egfr": egfr,
+            "egfr": egfr_rounded,       # 展示值（round 0.1）
+            "egfr_raw": egfr,           # N1：未舍入原始值（分期/趋势规则判级用）
             "unit": "ml/min/1.73m2",
             "method": method,
             "formula": formula,
@@ -308,11 +317,17 @@ def classify_ckd(
     egfr: float,
     uacr_mg_g: Optional[float] = None,
     upcr_mg_g: Optional[float] = None,
+    dialysis_mode: Optional[str] = None,
 ) -> dict:
     """KDIGO 2024 儿童 CKD 合并分期。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
     egfr 必需；白蛋白尿二选一（uacr 或 upcr）。返回 g、a、stage(GxAx)、description、risk_note。
+
+    S1 修复（2026-08-13）：新增 dialysis_mode 可选入参——透析患儿 eGFR<15 分期为
+    G5D（KDIGO 2024 / PRNT 2025），与 G5 区分（随访频率不同：G5D 每月 vs G5 每 60 天）。
+    合法值：none / hemodialysis / peritoneal（透传 classify 后的 G5D 供 care 层消费）。
+
     BUG-34：显式取 caller 并回写审计字段。
     """
     caller = get_caller()
@@ -321,6 +336,8 @@ def classify_ckd(
     egfr = _require_finite(egfr, "egfr")
     if egfr < 0:
         raise ValueError("egfr 必须 >= 0")
+    if dialysis_mode is not None and not isinstance(dialysis_mode, str):
+        raise ValueError("dialysis_mode 必须为字符串（none/hemodialysis/peritoneal）")
     if uacr_mg_g is not None:
         uacr_mg_g = _require_finite(uacr_mg_g, "uacr_mg_g")
         if uacr_mg_g < 0:
@@ -330,7 +347,7 @@ def classify_ckd(
         if upcr_mg_g < 0:
             raise ValueError("upcr_mg_g 不能为负")
 
-    g = _egfr_to_g(egfr)
+    g = _egfr_to_g(egfr, dialysis_mode)
     a: Optional[str] = None
     albuminuria_source = ""
     albuminuria_note = None
@@ -363,6 +380,8 @@ def classify_ckd(
         "G3b": "eGFR 30–44，中-重度下降",
         "G4": "eGFR 15–29，重度下降",
         "G5": "eGFR < 15，肾衰竭",
+        # S1 修复（2026-08-13）：透析患儿单独列 G5D——随访频率与 G5 不同
+        "G5D": "eGFR < 15 且正在透析（G5D）",
     }[g]
     a_desc = None
     if a is not None:
@@ -399,7 +418,8 @@ def classify_ckd(
 
 def _risk_note(g: str, a: Optional[str]) -> str:
     """按 G/A 给出进展风险与随访强度提示（信息性）。"""
-    g_rank = {"G1": 0, "G2": 1, "G3a": 2, "G3b": 3, "G4": 4, "G5": 5}[g]
+    # S1 修复（2026-08-13）：G5D 与 G5 同属最高风险档（rank=5）
+    g_rank = {"G1": 0, "G2": 1, "G3a": 2, "G3b": 3, "G4": 4, "G5": 5, "G5D": 5}[g]
     a_rank = {"A1": 0, "A2": 1, "A3": 2}.get(a or "A1", 0)
     score = g_rank + a_rank
     if score >= 6:
@@ -484,6 +504,11 @@ def _validate_rules_schema(rules_doc: Dict[str, Any]) -> None:
     rules = rules_doc.get("rules")
     if not isinstance(rules, list) or not rules:
         raise ValueError("风险规则库缺少非空 'rules' 列表，拒绝加载")
+    # P1-6 修复（2026-08-13）：metric 值域校验——合法短名 = _LAB_ALIAS_TO_RULE 的
+    # short 集合（scr/k/p/hb/ca/na/ua/egfr/bun/uacr/upcr）。此前拼错的 metric（如
+    # "ks"）静默跳过该规则 → overall_level="none" 给临床"无风险"假象（fail-open）。
+    _VALID_RULE_METRICS = frozenset(short for _, (short, _f) in
+                                    ((k, v) for k, v in _LAB_ALIAS_TO_RULE.items()))
     for r in rules:
         if not isinstance(r, dict):
             raise ValueError(f"规则条目 {r!r} 非字典，拒绝加载")
@@ -494,6 +519,11 @@ def _validate_rules_schema(rules_doc: Dict[str, Any]) -> None:
         if r["level"] not in _VALID_RULE_LEVELS:
             raise ValueError(
                 f"规则 {r['id']} level={r['level']!r} 非法，必须是 {sorted(_VALID_RULE_LEVELS)}")
+        # P1-6：metric 必须落在合法短名集合内（fail-closed，防静默跳过规则）
+        if r.get("metric") not in _VALID_RULE_METRICS:
+            raise ValueError(
+                f"规则 {r['id']} metric={r.get('metric')!r} 非法，必须是 "
+                f"{sorted(_VALID_RULE_METRICS)}（P1-6：拼错 metric 会静默漏报）")
         if r["type"] == "absolute":
             op = r.get("operator")
             if op not in _VALID_ABS_OPS:
@@ -958,6 +988,7 @@ def assess_clinical_status(
     new_labs: Optional[Dict[str, float]] = None,
     prior_labs: Optional[Dict[str, float]] = None,
     prior_level: Optional[str] = None,
+    dialysis_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """一键评估 CKD 临床状态（eGFR + 分期 + 风险评分 DAG）。
 
@@ -967,6 +998,8 @@ def assess_clinical_status(
     sex（M/F/male/female/男/女）仅 method="classic" 且 ≥13y 时生效（女性 k=0.55）。
     serum_creatinine_unit（BUG-40 修复）：mg_dL 默认 / umol_L 自动 ÷88.4——P1 get_labs
     返回 scr_umol_L（µmol/L），直接透传会导致 eGFR 与风险规则的 scr 判断同时错 88 倍。
+    dialysis_mode（S1 修复，2026-08-13）：none/hemodialysis/peritoneal——透析患儿
+    eGFR<15 分期为 G5D，供 care 层随访频率区分（G5D 每月 vs G5 每 60 天）。
     BUG-34：显式取 caller 回写审计字段。
     BUG-35 说明（2026-08-12）：DAG 入口 enforce_read 后，内部子函数（calc_egfr_schwartz /
     classify_ckd / evaluate_risk_rules）各自再 enforce_read——这是**有意的防御纵深**
@@ -1054,9 +1087,12 @@ def assess_clinical_status(
     if not egfr_r.get("ok"):
         return egfr_r
     ckd_r = classify_ckd(
-        egfr=egfr_r["data"]["egfr"],
+        # N1 修复（2026-08-13）：判级用未舍入原始值 egfr_raw——round 值在边界
+        # （如 89.96→90.0）会翻 G2→G1；展示仍用 egfr（round 0.1）。
+        egfr=egfr_r["data"].get("egfr_raw", egfr_r["data"]["egfr"]),
         uacr_mg_g=uacr_mg_g,
         upcr_mg_g=upcr_mg_g,
+        dialysis_mode=dialysis_mode,
     )
     # 始终以本轮计算的 eGFR + 已传入参数打底做风险评估，不因未传 new_labs 而静默跳过
     # 2026-08-12（系统性审查，P3）：labs 直接基于**已归一化**的 norm_inputs 构造——
@@ -1065,7 +1101,9 @@ def assess_clinical_status(
     # 计算的短名键（scr/egfr，calc 已保证有限）与形参键（bun/uacr/upcr，入口已
     # Fail-Fast 校验为有限值或 None；形参优先于 new_labs 值），无需重复校验。
     labs = dict(norm_inputs)
-    for k, v in (("scr", scr_mgdl), ("egfr", egfr_r["data"]["egfr"]),
+    # N1 修复：R-07 趋势规则同样用未舍入 egfr_raw 判级（round 值会扰动 -25% 阈值判定）
+    _egfr_for_rules = egfr_r["data"].get("egfr_raw", egfr_r["data"]["egfr"])
+    for k, v in (("scr", scr_mgdl), ("egfr", _egfr_for_rules),
                  ("bun", bun_mg_dl), ("uacr", uacr_mg_g), ("upcr", upcr_mg_g)):
         if v is not None:
             labs[k] = v

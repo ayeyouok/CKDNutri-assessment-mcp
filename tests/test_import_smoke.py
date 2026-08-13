@@ -171,6 +171,36 @@ def test_plausibility_range_and_explain_null():
     assert core.explain_verdict(ev["data"])["ok"] is True
 
 
+def test_s1_dialysis_g5d():
+    """S1 修复（2026-08-13）回归：透析患儿 eGFR<15 → G5D（care 层据此给每月随访）。"""
+    from CKDNutri_assessment_mcp import core
+
+    # 透析 + eGFR<15 → G5D（hemodialysis / peritoneal / 大小写容错）
+    for mode in ("hemodialysis", "peritoneal", "Hemodialysis"):
+        r = core.classify_ckd(egfr=12.0, dialysis_mode=mode)
+        assert r["data"]["g"] == "G5D", (mode, r)
+    # 非透析 eGFR<15 → G5（G5D 不误报）
+    assert core.classify_ckd(egfr=12.0)["data"]["g"] == "G5"
+    assert core.classify_ckd(egfr=12.0, dialysis_mode="none")["data"]["g"] == "G5"
+    # 透析但 eGFR≥15 → 仍按数值分期（不透支 G5D）
+    assert core.classify_ckd(egfr=18.0, dialysis_mode="hemodialysis")["data"]["g"] == "G4"
+    # dialysis_mode 非字符串 → ValueError（fail-closed）
+    try:
+        core.classify_ckd(egfr=12.0, dialysis_mode=123)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("dialysis_mode=123 应抛 ValueError")
+    # DAG 端到端透传：透析 G5D / 非透析 G5
+    dag = core.assess_clinical_status(age_years=6, height_cm=115,
+                                      serum_creatinine_mgdl=4.0,
+                                      dialysis_mode="hemodialysis")
+    assert dag["data"]["ckd_g_stage"] == "G5D", dag["data"]
+    dag2 = core.assess_clinical_status(age_years=6, height_cm=115,
+                                       serum_creatinine_mgdl=4.0)
+    assert dag2["data"]["ckd_g_stage"] == "G5", dag2["data"]
+
+
 def test_contract_boundaries():
     """2026-08-13（assessment 二审 #7）契约测试：BUG-45 键名别名 / BUG-40 µmol 换算 /
     BUG-58 NaN / sex k / preterm / R-01/R-07/R-08 边界 / _invalid 分级 / explain 结构。
@@ -249,5 +279,6 @@ if __name__ == "__main__":
     test_rules_schema_validation()
     test_s4_unauthorized_nan_unit()
     test_plausibility_range_and_explain_null()
+    test_s1_dialysis_g5d()
     test_contract_boundaries()
     print("P4 SMOKE OK")
