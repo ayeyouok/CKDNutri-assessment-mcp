@@ -171,6 +171,77 @@ def test_plausibility_range_and_explain_null():
     assert core.explain_verdict(ev["data"])["ok"] is True
 
 
+def test_contract_boundaries():
+    """2026-08-13（assessment 二审 #7）契约测试：BUG-45 键名别名 / BUG-40 µmol 换算 /
+    BUG-58 NaN / sex k / preterm / R-01/R-07/R-08 边界 / _invalid 分级 / explain 结构。
+
+    此前这些修复全靠注释声明、无代码锁定——本轮实测全部行为正确后固化为回归。
+    """
+    from math import isclose
+
+    from CKDNutri_assessment_mcp import core
+    from CKDNutri_assessment_mcp.server import _invalid
+
+    # ① BUG-45 键名别名：scr mg/dL 双变体 → R-01 命中（此前缺失，编排层直传静默漏报 AKI）
+    # 数值用精确 +50%（1.5/1.0）——1.2/0.8 浮点误差 49.999…% 恰落阈值下，非别名问题。
+    for key in ("scr_mg_dL", "scr_mg_dl"):
+        r = core.evaluate_risk_rules(new_labs={key: 1.5}, prior_labs={key: 1.0})
+        assert r["ok"] is True, r
+        ids = {m["id"] for m in r["data"]["matched_rules"]}
+        assert "R-01" in ids, f"{key} 别名未触发 R-01（BUG-45 回归）"
+
+    # ② BUG-40 µmol/L 完整键名 → 等价命中（88.4 换算）
+    r = core.evaluate_risk_rules(new_labs={"scr_umol_L": 88.4 * 1.5},
+                                 prior_labs={"scr_umol_L": 88.4 * 1.0})
+    assert "R-01" in {m["id"] for m in r["data"]["matched_rules"]}, "umol_L 未触发 R-01"
+
+    # ③ BUG-58 NaN 全路径拒绝（evaluate 入口）
+    try:
+        core.evaluate_risk_rules(new_labs={"k": float("nan")})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("evaluate NaN 应抛 ValueError")
+
+    # ④ sex k：classic ≥13y 女性 k=0.55 vs 男性 0.70（eGFR 比值锁定）
+    f = core.calc_egfr_schwartz(14, 160, 1.0, method="classic", sex="F")["data"]["egfr"]
+    m = core.calc_egfr_schwartz(14, 160, 1.0, method="classic", sex="M")["data"]["egfr"]
+    assert isclose(f / m, 0.55 / 0.70, rel_tol=1e-3), (f, m)
+
+    # ⑤ preterm：<1y is_preterm k=0.33 vs 足月 0.45
+    p = core.calc_egfr_schwartz(0.5, 60, 0.8, method="classic", is_preterm=True)["data"]["egfr"]
+    t = core.calc_egfr_schwartz(0.5, 60, 0.8, method="classic", is_preterm=False)["data"]["egfr"]
+    assert isclose(p, 0.33 * 60 / 0.8, rel_tol=1e-2), p
+    assert isclose(t, 0.45 * 60 / 0.8, rel_tol=1e-2), t
+
+    # ⑥ R-01/R-08 边界：+50% 恰好命中 R-01 且不落 R-08；+30% 命中 R-08 且不落 R-01
+    ids50 = {m["id"] for m in core.evaluate_risk_rules(
+        new_labs={"scr": 1.5}, prior_labs={"scr": 1.0})["data"]["matched_rules"]}
+    assert "R-01" in ids50 and "R-08" not in ids50, ids50
+    ids30 = {m["id"] for m in core.evaluate_risk_rules(
+        new_labs={"scr": 1.3}, prior_labs={"scr": 1.0})["data"]["matched_rules"]}
+    assert "R-08" in ids30 and "R-01" not in ids30, ids30
+
+    # ⑦ R-07 down 单阈值 -25%：恰好命中；-24.8% 不命中
+    assert "R-07" in {m["id"] for m in core.evaluate_risk_rules(
+        new_labs={"egfr": 45.0}, prior_labs={"egfr": 60.0})["data"]["matched_rules"]}
+    assert "R-07" not in {m["id"] for m in core.evaluate_risk_rules(
+        new_labs={"egfr": 45.1}, prior_labs={"egfr": 60.0})["data"]["matched_rules"]}
+
+    # ⑧ _invalid 错误分级（BUG-52/54）：ValueError→INVALID_INPUT、数据错误→INTERNAL_ERROR+脱敏
+    assert _invalid(ValueError("入参错"))["error"] == "INVALID_INPUT"
+    assert _invalid(FileNotFoundError("/var/app/data/rules.json"))["error"] == "INTERNAL_ERROR"
+    assert "/var/app" not in str(_invalid(FileNotFoundError("/var/app/data/rules.json")))
+
+    # ⑨ explain_verdict 结构校验：残缺 matched_rules 显式报错（不静默当"无命中"）
+    try:
+        core.explain_verdict({"ok": True, "data": {"matched_rules": [{"id": "R-01"}]}})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("残缺 matched_rules 应抛 ValueError")
+
+
 if __name__ == "__main__":
     test_server_imports()
     test_assess_and_explain()
@@ -178,4 +249,5 @@ if __name__ == "__main__":
     test_rules_schema_validation()
     test_s4_unauthorized_nan_unit()
     test_plausibility_range_and_explain_null()
+    test_contract_boundaries()
     print("P4 SMOKE OK")

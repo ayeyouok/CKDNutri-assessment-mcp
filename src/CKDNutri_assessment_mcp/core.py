@@ -194,6 +194,11 @@ def calc_egfr_schwartz(
         egfr = _BEDSIDE_K * height_cm / denom
         formula = f"eGFR = 0.413×height/(Scr + 0.003×BUN − 0.024)"
         note = "含 BUN 修订 Schwartz 2009，对 eGFR<60 的儿童更准确。"
+        # 2026-08-13（二审 #1）：早产儿显式提示——revised2009 固定 k=0.413 无早产修正
+        # （相对 k=0.33 高估 ~25%），与床旁式同口径提示，不静默吞参（不做数值修正）。
+        if is_preterm and age_years < 1:
+            note += (" 注意：is_preterm=True 时 revised2009 仍用固定 k=0.413（无早产修正），"
+                     "相对早产 k=0.33 高估 eGFR 约 25%；如需 k=0.33 请用 method='classic'。")
     else:  # bedside2009
         egfr = _BEDSIDE_K * height_cm / scr
         formula = "eGFR = 0.413×height/Scr"
@@ -250,8 +255,14 @@ def scr_umol_to_mgdl(value_umol_L: float) -> float:
 
 
 def _normalize_unit(unit: str | None) -> str:
-    """单位字符串归一化单一事实源：小写 + 去空格 + µ→u，缺省 mg_dL。"""
-    return (unit or "mg_dL").strip().lower().replace("µ", "u")
+    """单位字符串归一化单一事实源：小写 + 去空格/斜杠 + µ→u，缺省 mg_dL。
+
+    2026-08-13（二审 #4）：兼容带斜杠/空格的写法（"umol/L"、"mg/dL"、"umol/l"）——
+    docstring 与文档均用 "µmol/L" 写法，core 是可直接 import 的纯函数库，
+    编排层照抄注释写法直调会误抛 ValueError；归一化后再匹配。
+    """
+    u = (unit or "mg_dL").strip().lower().replace("µ", "u")
+    return u.replace("/", "").replace(" ", "")
 
 
 def _normalize_scr(value: float, unit: str) -> float:
@@ -498,7 +509,16 @@ def _validate_rules_schema(rules_doc: Dict[str, Any]) -> None:
             if direction not in _VALID_TREND_DIRECTIONS:
                 raise ValueError(
                     f"规则 {r['id']} direction={direction!r} 非法，必须是 up / down")
-            if "low_pct" in r or "high_pct" in r:
+            # 2026-08-13（二审 #3）：单阈值（threshold_pct）与区间（low_pct/high_pct）
+            # **二选一互斥**——此前 R-08 曾同时携带 threshold_pct:30 与 low/high:30/50
+            # （矛盾配置被静默接受，语义由"区间优先"掩盖）；fail-closed 拒绝混用。
+            has_single = "threshold_pct" in r
+            has_range = "low_pct" in r or "high_pct" in r
+            if has_single and has_range:
+                raise ValueError(
+                    f"规则 {r['id']} threshold_pct 与 low_pct/high_pct 必须二选一（互斥），"
+                    f"当前同时提供")
+            if has_range:
                 low_pct, high_pct = r.get("low_pct"), r.get("high_pct")
                 if not (isinstance(low_pct, (int, float)) and isinstance(high_pct, (int, float))
                         and low_pct < high_pct):
@@ -644,6 +664,12 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
 # 现入口统一归一化：完整键名 → 短名 + 单位换算（仅 scr_umol_L 需要 ÷88.4，其余单位一致）。
 _LAB_ALIAS_TO_RULE: dict[str, tuple[str, float]] = {
     "scr_umol_L": ("scr", _SCR_UMOL_TO_MGDL),   # µmol/L → mg/dL（单一事实源）
+    # 2026-08-13（二审 #2）：补 scr mg/dL 完整键名变体——与 bun_mg_dL/bun_mg_dl 对称
+    # （P1 输入模型/别名表存在 scr_mg_dL 大写 L 风格）。此前缺失：编排层直传
+    # new_labs={"scr_mg_dL":...} 时 R-01（L1 AKI 危急规则）静默不触发，与 BUG-45
+    # 修复初衷相悖。两变体系数 1.0（mg/dL 与规则单位一致）。
+    "scr_mg_dl": ("scr", 1.0),
+    "scr_mg_dL": ("scr", 1.0),
     "k_mmol_L": ("k", 1.0),
     "p_mmol_L": ("p", 1.0),
     "hb_g_L": ("hb", 1.0),
@@ -828,7 +854,9 @@ def list_rules() -> Dict[str, Any]:
                                   # _load_rules 加载时已归一化，此处与 _eval_rule 同口径
                                   else f"[{float(r['low'])}, {float(r['high'])})")
         else:
-            entry["criterion"] = (f"{r['direction']} {r.get('threshold_pct', '')}%"
+            # 2026-08-13（二审 #8）：单阈值趋势补 ">= " 前缀——与 _eval_rule 的
+            # threshold 展示（">= 50"）一致；此前输出 "up 50%" 缺比较符，语义模糊。
+            entry["criterion"] = (f"{r['direction']} >= {r['threshold_pct']}%"
                                   if "low_pct" not in r
                                   else f"{r['direction']} [{r['low_pct']}, {r['high_pct']})%")
         out.append(entry)

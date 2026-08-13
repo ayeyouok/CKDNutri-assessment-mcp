@@ -27,7 +27,6 @@
       "type": "trend_pct",
       "metric": "scr",
       "direction": "up",
-      "threshold_pct": 30,
       "low_pct": 30,
       "high_pct": 50,
       "unit": "%",
