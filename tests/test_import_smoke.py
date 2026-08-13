@@ -94,9 +94,88 @@ def test_rules_schema_validation():
     core._validate_rules_schema(dict(rules_doc))
 
 
+def test_s4_unauthorized_nan_unit():
+    """S4（2026-08-13）补全：越权 / NaN / 单位换算自动化用例。"""
+    from math import isclose
+
+    from a207_policy import PermissionDenied
+
+    from CKDNutri_assessment_mcp import core
+
+    # ① 越权：parent_assistant 对 P4 矩阵 = ACCESS_NONE，直接调计算工具必须被拒
+    os.environ["A207_CALLER"] = "parent_assistant"
+    try:
+        try:
+            core.calc_egfr_schwartz(age_years=6, height_cm=115, serum_creatinine_mgdl=0.6)
+        except PermissionDenied:
+            pass
+        else:
+            raise AssertionError("家长调用 calc_egfr_schwartz 应抛 PermissionDenied")
+    finally:
+        os.environ["A207_CALLER"] = "doctor_assistant"
+
+    # ② NaN/Inf：scr 非有限值拒绝（六审已修 _normalize_scr 先 _require_finite）
+    for bad in (float("nan"), float("inf")):
+        try:
+            core.calc_egfr_schwartz(age_years=6, height_cm=115, serum_creatinine_mgdl=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"scr={bad} 应抛 ValueError")
+    try:
+        core.scr_umol_to_mgdl(float("nan"))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("scr_umol_to_mgdl(NaN) 应抛 ValueError")
+
+    # ③ 单位换算：88.4 µmol/L ≡ 1.0 mg/dL（eGFR 结果一致）；显式换算函数正确
+    a = core.calc_egfr_schwartz(age_years=6, height_cm=115, serum_creatinine_mgdl=1.0)
+    b = core.calc_egfr_schwartz(age_years=6, height_cm=115, serum_creatinine_mgdl=88.4,
+                                serum_creatinine_unit="umol_L")
+    assert a["ok"] is True and b["ok"] is True
+    assert isclose(a["data"]["egfr"], b["data"]["egfr"], rel_tol=1e-9), (a, b)
+    assert isclose(core.scr_umol_to_mgdl(88.4), 1.0, rel_tol=1e-9)
+
+
+def test_plausibility_range_and_explain_null():
+    """2026-08-13（assessment 专项审查）回归：
+    ① 临床合理性范围——age/height/scr 超物理区间拒绝（此前仅有限性/非负校验）；
+    ② explain_verdict 对 {ok:true, data:null} 异常信封显式报错（此前静默当"无规则命中"）。"""
+    from CKDNutri_assessment_mcp import core
+
+    def _raises(fn, label):
+        try:
+            fn()
+        except ValueError:
+            return
+        raise AssertionError(f"期望 {label} 抛 ValueError")
+
+    # ① 合理性范围
+    _raises(lambda: core.calc_egfr_schwartz(age_years=200, height_cm=115,
+                                            serum_creatinine_mgdl=0.6), "age=200 超上限")
+    _raises(lambda: core.calc_egfr_schwartz(age_years=6, height_cm=9999,
+                                            serum_creatinine_mgdl=0.6), "height=9999 超上限")
+    _raises(lambda: core.calc_egfr_schwartz(age_years=6, height_cm=115,
+                                            serum_creatinine_mgdl=1e-6), "scr=1e-6 超下限")
+    # 合法边界不误拦
+    r = core.calc_egfr_schwartz(age_years=6, height_cm=115, serum_creatinine_mgdl=0.6)
+    assert r["ok"] is True
+
+    # ② explain_verdict 异常信封 fail-closed
+    _raises(lambda: core.explain_verdict({"ok": True, "data": None}),
+            "{ok:true, data:null} 信封")
+    # 正常信封与裸 data 仍兼容
+    ev = core.evaluate_risk_rules(new_labs={"scr": 0.6, "hb": 90})
+    assert core.explain_verdict(ev)["ok"] is True
+    assert core.explain_verdict(ev["data"])["ok"] is True
+
+
 if __name__ == "__main__":
     test_server_imports()
     test_assess_and_explain()
     test_empty_labs_evaluation_note()
     test_rules_schema_validation()
+    test_s4_unauthorized_nan_unit()
+    test_plausibility_range_and_explain_null()
     print("P4 SMOKE OK")

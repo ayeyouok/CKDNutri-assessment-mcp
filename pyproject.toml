@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "CKDNutri-assessment-mcp"
-version = "0.3.32"
+version = "0.3.34"
 description = "P4 评估计算域——eGFR+CKD分期+风险引擎（纯函数）"
 requires-python = ">=3.10"
 dependencies = [
@@ -24,3 +24,12 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 CKDNutri_assessment_mcp = ["data/*.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]  # 行超长不阻断（存量历史注释多），仅提示

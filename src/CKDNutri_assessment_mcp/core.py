@@ -4,7 +4,7 @@
 不依赖 fastmcp，可直接 import 单测。所有公式口径在 ADR-006 锁定。
 
 公式来源与口径（ADR-006）：
-- eGFR（床旁 Schwartz 2009）：eGFR = 0.413 × 身高(cm) / Scr(mg/dL)，结果以 ml/min/1.73m² 计。
+- eGFR（床旁 Schwartz 2009）：eGFR = 0.413 × 身高(cm) / Scr(mg/dL)，结果以 ml/min/1.73m2 计。
   这是当前 KDIGO / 中国儿科 CKD 随访最常用的体表面积标准化估算式。
 - eGFR（含 BUN 修订 Schwartz 2009）：当提供 BUN 且怀疑 eGFR<60 时采用
   eGFR = 0.413 × 身高 / (Scr + 0.003×BUN − 0.024)，对低 eGFR 儿童更准确。
@@ -30,10 +30,24 @@ MCP_NAME = "CKDNutri-assessment-mcp"
 EgfrMethod = Literal["bedside2009", "revised2009", "classic"]
 
 _BEDSIDE_K = 0.413  # Schwartz 2009 床旁系数
+# 肌酐单位换算单一事实源：µmol/L → mg/dL（P1 get_labs 输出 scr_umol_L 转 P4 公式所需单位）
+_SCR_UMOL_TO_MGDL = 1.0 / 88.4
+
+# 临床合理性范围（儿童 CKD 系统，超物理区间直接拒绝，防荒谬 eGFR 被分期）
+_MAX_AGE_YEARS = 18.0      # 本系统为儿童 CKD（PRNT/KDIGO 儿童适用域）
+_MAX_HEIGHT_CM = 250.0     # 儿童身高物理上限（超此值必为录入错误）
+_MIN_SCR_MGDL = 0.05       # 血肌酐 mg/dL 下限（低于此值 eGFR 荒谬放大，必为录入错误）
+
+# 规则 schema 枚举与必填键（fail-closed 校验单一事实源，集中模块顶部）
+_VALID_RULE_LEVELS = frozenset({"L1", "L2", "L3"})
+_VALID_ABS_OPS = frozenset({"gt", "gte", "lt", "lte", "between"})
+_VALID_TREND_DIRECTIONS = frozenset({"up", "down"})
+_RULE_REQUIRED_KEYS = ("id", "name", "level", "type", "metric", "unit", "description")
+_LEVEL_RANK = {"L1": 3, "L2": 2, "L3": 1, "none": 0}
 
 
 def _egfr_to_g(egfr: float) -> str:
-    """KDIGO 2024 儿童 eGFR 分期（ml/min/1.73m²）。"""
+    """KDIGO 2024 儿童 eGFR 分期（ml/min/1.73m2）。"""
     if egfr >= 90:
         return "G1"
     if egfr >= 60:
@@ -59,11 +73,9 @@ def _acr_to_a(uacr_mg_g: float) -> str:
 def _normalize_sex(sex: Optional[str]) -> Optional[str]:
     """统一清洗 sex 参数：去空格/大小写归一 → "female" | "male" | None。
 
-    2026-08-12（系统性审查，P1）：此前 `_schwartz_k` 与 calc 的 sex_note 各自重复
-    `str(sex).strip().upper() in (...)`——若未来某处重构只做 `.lower()` 未 `.strip()`，
-    ≥13y 女性患儿将静默降级回 k=0.70（eGFR 高估 27%）且无任何报错。集中归一化
-    消除双轨漂移：所有 sex 判定（_schwartz_k / sex_note / DAG 入口）统一走本函数。
-    未知值（如 "unknown"）返回 None（向后兼容保持 0.70，不报错）。
+    所有 sex 判定（_schwartz_k / sex_note / DAG 入口）统一走本函数，防双轨漂移——
+    某处只 lower 未 strip 会把 ≥13y 女性静默降级 k=0.70（eGFR 高估 27%）。
+    未知值返回 None（向后兼容保持 0.70）。
     """
     if sex is None:
         return None
@@ -80,12 +92,8 @@ def _schwartz_k(age_years: float, k_value: Optional[float], is_preterm: bool = F
     """Schwartz 经典 k 值：早产儿(<37周) 0.33、<1yr 足月儿 0.45、1-12yr=0.55、
     ≥13yr 青少年男性 0.70 / 女性 0.55（经典 Schwartz 1976/1984 参数表）。
 
-    BUG-47（2026-08-12）：早产儿 k=0.33 正式实现——CAKUT（先天性肾发育不良）是儿童 CKD
-    首要病因，早产儿占比高；用 0.45 替代 0.33 会把 eGFR 高估约 36%（0.45/0.33），
-    可能将 G4 误判为 G3。调用方须在已知早产时传 is_preterm=True（<1yr 生效）。
-    2026-08-12（系统性审查，P1）：≥13y 性别分化——青少年女性肌肉量显著低于男性，
-    经典参数表 k=0.55（用 0.70 会高估 eGFR 约 27%）。sex 接受 M/F/male/female/男/女，
-    None 或未知值保持 0.70（向后兼容）；显式 k_value 仍优先于一切内置参数。
+    k_value 显式传入优先。早产修正与 ≥13y 性别分化是关键临床项（用错可致 eGFR
+    高估 27-36% 并误分期），调用方须按病史与性别正确传参。
     """
     if k_value is not None:
         return float(k_value)
@@ -112,7 +120,7 @@ def calc_egfr_schwartz(
     """估算肾小球滤过率（Schwartz 系列）。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1：模型不可自证身份）。
-    返回：egfr(ml/min/1.73m²)、method、formula(所用公式串)、note(警示/口径)。
+    返回：egfr(ml/min/1.73m2)、method、formula(所用公式串)、note(警示/口径)。
     BUG-34（2026-08-12）：显式取 caller 并回写审计字段（此前仅 enforce_read 内部取用，
     调用者身份不落返回，无法追溯谁触发了计算）。
     BUG-40（2026-08-12）：新增 serum_creatinine_unit 单位归一化——P1 clinical-data
@@ -134,16 +142,25 @@ def calc_egfr_schwartz(
             f"无效的 method: '{method}'，必须为 bedside2009 / revised2009 / classic 之一"
         )
     # BUG-58：显式拒绝 NaN/Inf 入参（NaN 身高/肌酐会算出 NaN eGFR，再被 classify_ckd 静默归 G5）
+    # 2026-08-13（policy 审查，高优先级#5）：补**临床合理性上限**——此前仅做有限性与
+    # 非负校验，age=200 / height=9999 / scr=1e-6 会算出荒谬 eGFR 并被分期。物理区间
+    # 超限一律拒绝（录入错误），常量见模块顶部 _MAX_AGE_YEARS/_MAX_HEIGHT_CM/_MIN_SCR_MGDL。
     age_years = _require_finite(age_years, "age_years")
     height_cm = _require_finite(height_cm, "height_cm")
     if age_years < 0:
         raise ValueError("age_years 不能为负")
+    if age_years > _MAX_AGE_YEARS:
+        raise ValueError(f"age_years 超出儿童 CKD 适用域（> {_MAX_AGE_YEARS:.0f} 岁）")
     if height_cm <= 0:
         raise ValueError("height_cm 必须 > 0")
+    if height_cm > _MAX_HEIGHT_CM:
+        raise ValueError(f"height_cm 超出物理合理范围（> {_MAX_HEIGHT_CM:.0f} cm）")
     scr = _require_finite(_normalize_scr(serum_creatinine_mgdl, serum_creatinine_unit),
                           "serum_creatinine")
     if scr <= 0:
         raise ValueError("serum_creatinine 必须 > 0")
+    if scr < _MIN_SCR_MGDL:
+        raise ValueError(f"serum_creatinine 低于物理合理下限（< {_MIN_SCR_MGDL} mg/dL）")
     if method == "revised2009":
         if bun_mg_dl is None:
             raise ValueError("revised2009 需要 bun_mg_dl > 0")
@@ -221,40 +238,47 @@ def calc_egfr_schwartz(
 
 
 def scr_umol_to_mgdl(value_umol_L: float) -> float:
-    """显式单位转换：µmol/L → mg/dL（÷88.4）。供编排层把 P1 get_labs 的
-    `scr_umol_L` 转成 P4 eGFR 公式所需单位（BUG-40）。
+    """显式单位转换：µmol/L → mg/dL（换算系数单一事实源 _SCR_UMOL_TO_MGDL）。
 
-    四审（2026-08-12）：补入参校验（fail-closed）——NaN/Inf 转换后仍是脏值且无报错
-    （与 _require_finite 全库口径一致）；负肌酐物理上不可能，显式拒绝。
+    供编排层把 P1 get_labs 的 `scr_umol_L` 转成 P4 eGFR 公式所需单位。
+    入参 fail-closed：NaN/Inf/负值拒绝（物理上不可能，显式报错）。
     """
     v = _require_finite(value_umol_L, "value_umol_L")
     if v < 0:
         raise ValueError("value_umol_L 不能为负")
-    return v / 88.4
+    return v * _SCR_UMOL_TO_MGDL
+
+
+def _normalize_unit(unit: str | None) -> str:
+    """单位字符串归一化单一事实源：小写 + 去空格 + µ→u，缺省 mg_dL。"""
+    return (unit or "mg_dL").strip().lower().replace("µ", "u")
 
 
 def _normalize_scr(value: float, unit: str) -> float:
-    """按声明单位归一化肌酐到 mg/dL；非法单位显式报错（fail-closed）。"""
-    v = float(value)
-    u = (unit or "mg_dL").strip().lower().replace("µ", "u")
+    """按声明单位归一化肌酐到 mg/dL；非法单位显式报错（fail-closed）。
+
+    fail-closed 说明：先 _require_finite 再换算——None/NaN/Inf 统一 ValueError
+    （此前 float(None) 抛 TypeError 冒泡，core 直调不优雅）。
+    """
+    v = _require_finite(value, "serum_creatinine")
+    u = _normalize_unit(unit)
     if u in ("mg_dl", "mgdl", "mg"):
         return v
     if u in ("umol_l", "umoll", "umol"):
-        return v / 88.4
+        return v * _SCR_UMOL_TO_MGDL
     raise ValueError(f"无效的 serum_creatinine_unit: {unit!r}，可用 mg_dL / umol_L")
 
 
 def _unit_label(unit: str) -> str:
-    u = (unit or "mg_dL").strip().lower().replace("µ", "u")
+    u = _normalize_unit(unit)
     return "umol/L（已 ÷88.4 转 mg/dL）" if u in ("umol_l", "umoll", "umol") else "mg/dL"
 
 
 def _require_finite(value: Any, name: str) -> float:
-    """把输入转 float 并显式拒绝 NaN/Inf（BUG-58，2026-08-12）。
+    """把输入转 float 并显式拒绝 NaN/Inf（fail-closed）。
 
-    NaN 会静默穿透所有比较：`nan < 0` 为 False（绕过负数校验）、`_egfr_to_g(nan)`
-    全分支不命中最终返回 G5（肾衰竭）；`inf` 反之 `>= 90` 恒真落 G1。数值异常
-    必须显式报错，不得静默误分期（临床安全）。
+    原因：NaN 静默穿透所有比较（nan<0=False 绕过负数校验、_egfr_to_g(nan) 落 G5），
+    inf 恒真落 G1——数值异常必须显式报错，不得静默误分期（临床安全）。
     """
     try:
         v = float(value)
@@ -375,13 +399,12 @@ def _risk_note(g: str, a: Optional[str]) -> str:
         note += ("（白蛋白尿 A 分期未计入评分：未提供 UACR 或仅提供 UPCR；"
                  "实际进展风险可能更高，请补充 UACR 后复评。）")
     return note
-_LEVEL_RANK = {"L1": 3, "L2": 2, "L3": 1, "none": 0}
 
 _RULES_PATH = os.path.join(os.path.dirname(__file__), "data", "rules.json")
 _RULES: Optional[Dict[str, Any]] = None
 _RULES_VIEW: Optional[Mapping[str, Any]] = None
-# 2026-08-12（系统性审查，P2）：懒加载并发锁——FastMCP/多 worker 线程并发首次调用时
-# 防重复 I/O 与重复 JSON 解析（double-checked locking，GIL 下安全）。
+# 懒加载并发锁：FastMCP/多 worker 线程并发首次调用时防重复 I/O 与重复 JSON 解析
+# （double-checked locking，GIL 下安全）。
 _RULES_LOCK = threading.Lock()
 
 
@@ -427,14 +450,12 @@ def _load_rules() -> Mapping[str, Any]:
     return _RULES_VIEW
 
 
-# 规则 level 合法枚举（L1>L2>L3，_LEVEL_RANK 的合法键集合）
-_VALID_RULE_LEVELS = frozenset({"L1", "L2", "L3"})
-# absolute 单边运算符合法集
-_VALID_ABS_OPS = frozenset({"gt", "gte", "lt", "lte", "between"})
-# trend 方向合法集
-_VALID_TREND_DIRECTIONS = frozenset({"up", "down"})
-# 规则必填元数据键（缺任一即拒绝加载）
-_RULE_REQUIRED_KEYS = ("id", "name", "level", "type", "metric", "unit", "description")
+def _reset_rules_cache() -> None:
+    """测试辅助：重置规则库懒加载缓存（force_reload 语义）。生产路径勿调。"""
+    global _RULES, _RULES_VIEW
+    with _RULES_LOCK:
+        _RULES = None
+        _RULES_VIEW = None
 
 
 def _validate_rules_schema(rules_doc: Dict[str, Any]) -> None:
@@ -545,7 +566,9 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
             low, high = rule["low"], rule["high"]
             hit = low <= v < high
         else:
-            hit = False
+            # schema 校验（_validate_rules_schema）已 fail-closed 拒绝非法 operator，
+            # 运行期不可达；保留显式报错（而非静默 hit=False 漏报）以防 schema 漏判。
+            raise ValueError(f"规则 {rule.get('id', '?')} 的 operator 非法: {op!r}")
         if not hit:
             return None
         op_label = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}.get(op, op)
@@ -620,7 +643,7 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
 # 使全部 absolute 规则静默跳过（overall_level="none" 假象），且 scr 单位差 88.4 倍。
 # 现入口统一归一化：完整键名 → 短名 + 单位换算（仅 scr_umol_L 需要 ÷88.4，其余单位一致）。
 _LAB_ALIAS_TO_RULE: dict[str, tuple[str, float]] = {
-    "scr_umol_L": ("scr", 1.0 / 88.4),   # µmol/L → mg/dL
+    "scr_umol_L": ("scr", _SCR_UMOL_TO_MGDL),   # µmol/L → mg/dL（单一事实源）
     "k_mmol_L": ("k", 1.0),
     "p_mmol_L": ("p", 1.0),
     "hb_g_L": ("hb", 1.0),
@@ -828,8 +851,18 @@ def explain_verdict(evaluation: Dict[str, Any]) -> Dict[str, Any]:
     if evaluation.get("ok") is False:
         raise ValueError(
             f"无法解释失败的评估结果：{evaluation.get('error')} {evaluation.get('detail', '')}".strip())
-    data = evaluation.get("data")
-    payload = data if isinstance(data, dict) else evaluation
+    # 信封模式（含 data 键）：data 必须为 dict——{ok:true, data:null} 属于异常信封，
+    # 显式报错而非静默当"无规则命中"（fail-closed，与 BUG-58 原则一致）。
+    # 裸 data 模式（无 data 键）：evaluation 即业务体（向后兼容）。
+    if "data" in evaluation:
+        data = evaluation["data"]
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"无法解释无效的评估结果：{evaluation.get('ok')} 信封的 data 应为 dict，"
+                f"实际为 {type(data).__name__}")
+        payload = data
+    else:
+        payload = evaluation
     chain = []
     # BUG（2026-08-12，P0）：assess_clinical_status 输出的命中规则键名为
     # risk_matched_rules，而 evaluate_risk_rules 用 matched_rules——直接把 DAG 结果
@@ -993,7 +1026,6 @@ def assess_clinical_status(
         uacr_mg_g=uacr_mg_g,
         upcr_mg_g=upcr_mg_g,
     )
-    risk_r: Dict[str, Any] = {}
     # 始终以本轮计算的 eGFR + 已传入参数打底做风险评估，不因未传 new_labs 而静默跳过
     # 2026-08-12（系统性审查，P3）：labs 直接基于**已归一化**的 norm_inputs 构造——
     # 此前基于原始 new_labs 再调 _normalize_labs(labs) 重复一遍完整键名换算+遍历。
@@ -1018,10 +1050,7 @@ def assess_clinical_status(
     # rules.json 全部规则依赖 ca/egfr/hb/k/p/scr/ua，若调用方未传 new_labs，
     # labs 仅含 scr+egfr（+可选 bun/uacr/upcr），电解质/贫血规则会被静默跳过，
     # 直接返回 overall_level="none" 会给临床"已全面评估且无风险"的假象。
-    # 2026-08-12（系统性审查，P2）：合并规则读取——此前 rule_metrics / trend_rules
-    # 各调一次 _load_rules()（每次 deepcopy），单次 DAG 连同 evaluate 内部共 3 次深拷贝；
-    # 高并发下徒增临时对象与 GC 压力。此处读一次复用（evaluate_risk_rules 内部因函数
-    # 独立契约仍各读一次，DAG 自身从 3 次降到 2 次）。
+    # 规则库读一次复用（避免 DAG 内多路各 deepcopy 一次）。
     rules_doc = _load_rules()
     rule_metrics = sorted({rule["metric"] for rule in rules_doc["rules"]})
     # BUG-58（2026-08-12）：覆盖度统计须基于归一化键名——调用方传 P1 完整键名
