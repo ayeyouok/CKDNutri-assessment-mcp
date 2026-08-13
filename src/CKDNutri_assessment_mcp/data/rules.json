@@ -1,6 +1,6 @@
 {
   "meta": {
-    "note": "M8 内置规则库。单位遵循 PCP 契约标准单位：scr=mg/dL, k=mmol/L, p=mmol/L, hb=g/L, ca=mmol/L, ua=umol/L, egfr=ml/min/1.73m^2。引擎不做单位换算，调用方须传规范单位（见 PCP 契约）。",
+    "note": "M8 内置规则库。单位遵循 PCP 契约标准单位：scr=mg/dL, k=mmol/L, p=mmol/L, hb=g/L, ca=mmol/L, ua=umol/L, egfr=ml/min/1.73m^2。四审（2026-08-12）：引擎入口已做键名+单位归一化（BUG-45：P1 完整键名如 scr_umol_L/k_mmol_L 自动映射到规则短名并换算单位，scr_umol_L ÷88.4、bun_mmol_L ×2.8），调用方可直接透传 P1 get_labs 返回值；规则库内部一律用短名+规范单位。",
     "level_correction": "新数据驱动重评；prior_level 仅作对比，缺失新数据时绝不兜底输出历史等级。"
   },
   "level_meaning": {

@@ -18,8 +18,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 
-from typing import Any, Dict, List, Literal, Optional
+from types import MappingProxyType
+from typing import Any, Dict, List, Literal, Mapping, Optional
 
 from a207_policy import enforce_read, get_caller
 
@@ -54,18 +56,44 @@ def _acr_to_a(uacr_mg_g: float) -> str:
     return "A3"
 
 
-def _schwartz_k(age_years: float, k_value: Optional[float], is_preterm: bool = False) -> float:
-    """Schwartz 经典 k 值：早产儿(<37周) 0.33、<1yr 足月儿 0.45、1-12yr=0.55、≥13yr=0.70。
+def _normalize_sex(sex: Optional[str]) -> Optional[str]:
+    """统一清洗 sex 参数：去空格/大小写归一 → "female" | "male" | None。
+
+    2026-08-12（系统性审查，P1）：此前 `_schwartz_k` 与 calc 的 sex_note 各自重复
+    `str(sex).strip().upper() in (...)`——若未来某处重构只做 `.lower()` 未 `.strip()`，
+    ≥13y 女性患儿将静默降级回 k=0.70（eGFR 高估 27%）且无任何报错。集中归一化
+    消除双轨漂移：所有 sex 判定（_schwartz_k / sex_note / DAG 入口）统一走本函数。
+    未知值（如 "unknown"）返回 None（向后兼容保持 0.70，不报错）。
+    """
+    if sex is None:
+        return None
+    s = str(sex).strip().upper()
+    if s in ("F", "FEMALE", "女"):
+        return "female"
+    if s in ("M", "MALE", "男"):
+        return "male"
+    return None
+
+
+def _schwartz_k(age_years: float, k_value: Optional[float], is_preterm: bool = False,
+                sex: Optional[str] = None) -> float:
+    """Schwartz 经典 k 值：早产儿(<37周) 0.33、<1yr 足月儿 0.45、1-12yr=0.55、
+    ≥13yr 青少年男性 0.70 / 女性 0.55（经典 Schwartz 1976/1984 参数表）。
 
     BUG-47（2026-08-12）：早产儿 k=0.33 正式实现——CAKUT（先天性肾发育不良）是儿童 CKD
     首要病因，早产儿占比高；用 0.45 替代 0.33 会把 eGFR 高估约 36%（0.45/0.33），
     可能将 G4 误判为 G3。调用方须在已知早产时传 is_preterm=True（<1yr 生效）。
+    2026-08-12（系统性审查，P1）：≥13y 性别分化——青少年女性肌肉量显著低于男性，
+    经典参数表 k=0.55（用 0.70 会高估 eGFR 约 27%）。sex 接受 M/F/male/female/男/女，
+    None 或未知值保持 0.70（向后兼容）；显式 k_value 仍优先于一切内置参数。
     """
     if k_value is not None:
         return float(k_value)
     if age_years < 1:
         return 0.33 if is_preterm else 0.45
     if age_years < 13:
+        return 0.55
+    if _normalize_sex(sex) == "female":
         return 0.55
     return 0.70
 
@@ -79,6 +107,7 @@ def calc_egfr_schwartz(
     k_value: Optional[float] = None,
     serum_creatinine_unit: str = "mg_dL",
     is_preterm: bool = False,
+    sex: Optional[str] = None,
 ) -> dict:
     """估算肾小球滤过率（Schwartz 系列）。
 
@@ -92,9 +121,14 @@ def calc_egfr_schwartz(
     mg/dL（默认仍为 mg_dL，向后兼容）。也提供显式转换函数 `scr_umol_to_mgdl`。
     BUG-47（2026-08-12）：新增 is_preterm——早产儿经典 k=0.33（仅 <1yr 生效），
     防 eGFR 高估 36%。
+    2026-08-12（系统性审查，P1）：新增 sex（M/F/male/female/男/女）——经典式 ≥13y
+    青少年女性 k=0.55（男性 0.70），防 eGFR 高估 27%；仅 method="classic" 生效。
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
+    # 2026-08-12（系统性审查，P3）：sex 入口归一化一次，sex_note 复用归一化值
+    # （_schwartz_k 内部保留 _normalize_sex 防御直接调用者，幂等无副作用）。
+    sex = _normalize_sex(sex)
     if method not in ("bedside2009", "revised2009", "classic"):
         raise ValueError(
             f"无效的 method: '{method}'，必须为 bedside2009 / revised2009 / classic 之一"
@@ -116,13 +150,25 @@ def calc_egfr_schwartz(
         bun_mg_dl = _require_finite(bun_mg_dl, "bun_mg_dl")
         if bun_mg_dl <= 0:
             raise ValueError("revised2009 需要 bun_mg_dl > 0")
+    # 2026-08-12（系统性审查，P1）：k_value 缺校验——k_value=0 会算出 eGFR=0 → classify
+    # 误判 G5；负值产生负 eGFR。显式强校验（与 age/height/scr 同口径）。
+    if k_value is not None:
+        k_value = _require_finite(k_value, "k_value")
+        if k_value <= 0:
+            raise ValueError("k_value 必须 > 0")
 
     if method == "classic":
-        k = _schwartz_k(age_years, k_value, is_preterm=is_preterm)
+        k = _schwartz_k(age_years, k_value, is_preterm=is_preterm, sex=sex)
         egfr = k * height_cm / scr
         formula = f"eGFR = k×height/Scr, k={k}"
         k_note = "早产儿 k=0.33" if (is_preterm and age_years < 1) else "经典年龄带 k"
-        note = f"{k_note}；<1y=0.45, 1-12y=0.55, ≥13y=0.70，可被 k_value 覆盖。"
+        sex_note = ("；≥13y 女性 k=0.55" if (age_years >= 13 and k_value is None
+                                            and sex == "female") else "")
+        note = f"{k_note}；<1y=0.45, 1-12y=0.55, ≥13y 男0.70/女0.55，可被 k_value 覆盖。{sex_note}"
+        # 四审（2026-08-12）：提供了 BUN 但 method 非 revised2009——静默丢弃提示
+        # （与 k_value 在 revised2009 下的丢弃提示同类型，防审计无感知）。
+        if bun_mg_dl is not None:
+            note += "（提供了 BUN 但经典式未使用，如需 BUN 修订请用 method='revised2009'）"
     elif method == "revised2009":
         # bun_mg_dl 已由前置校验保证非空 > 0，此处不再重复判定
         denom = scr + 0.003 * bun_mg_dl - 0.024
@@ -135,12 +181,27 @@ def calc_egfr_schwartz(
         egfr = _BEDSIDE_K * height_cm / scr
         formula = "eGFR = 0.413×height/Scr"
         note = "床旁 Schwartz 2009（KDIGO 推荐默认式）。"
+        # 2026-08-12（系统性审查，P1）：床旁式固定 k=0.413 无早产修正——若调用方显式
+        # 传 method="bedside2009" 且 is_preterm（<1y），k=0.413 相对早产 k=0.33 高估
+        # eGFR 约 25%（0.413/0.33）。显式提示改用 classic，不静默吞参。
+        if is_preterm and age_years < 1:
+            note += (" 注意：is_preterm=True 时床旁式仍用固定 k=0.413（无早产修正），"
+                     "相对早产 k=0.33 高估 eGFR 约 25%；如需 k=0.33 请用 method='classic'。")
+        # 四审（2026-08-12）：提供了 BUN 但未用 revised2009——静默丢弃提示
+        if bun_mg_dl is not None:
+            note += "（提供了 BUN 但床旁式未使用，如需 BUN 修订请用 method='revised2009'）"
 
     egfr = round(egfr, 1)
     pediatric_caveat = (
         "注意：<2 岁婴儿 eGFR 参考范围低于年长儿（正常可低至 60–90），"
         "G1/G2 阈值在婴儿期需结合月龄与生长曲线解读。"
         if age_years < 2 else ""
+    )
+    # 四审（2026-08-12）：>18 岁超出儿童 Schwartz 公式适用域——显式提示改用成人
+    # CKD-EPI 公式（此前静默计算，儿童系数用于成人会系统性偏估）。
+    adult_caveat = (
+        "注意：年龄 >18 岁超出儿童 Schwartz 公式适用域，建议改用成人 CKD-EPI 公式评估。"
+        if age_years > 18 else ""
     )
     # BUG-15：成功返回统一 {ok, data} 信封（此前扁平结构）；BUG-34：含 caller 审计字段
     return {
@@ -152,6 +213,7 @@ def calc_egfr_schwartz(
             "method": method,
             "formula": formula,
             "pediatric_caveat": pediatric_caveat,
+            "adult_caveat": adult_caveat,  # 四审：>18 岁超出儿童公式适用域提示
             "note": note,
             "scr_unit_used": _unit_label(serum_creatinine_unit),
         },
@@ -160,8 +222,15 @@ def calc_egfr_schwartz(
 
 def scr_umol_to_mgdl(value_umol_L: float) -> float:
     """显式单位转换：µmol/L → mg/dL（÷88.4）。供编排层把 P1 get_labs 的
-    `scr_umol_L` 转成 P4 eGFR 公式所需单位（BUG-40）。"""
-    return float(value_umol_L) / 88.4
+    `scr_umol_L` 转成 P4 eGFR 公式所需单位（BUG-40）。
+
+    四审（2026-08-12）：补入参校验（fail-closed）——NaN/Inf 转换后仍是脏值且无报错
+    （与 _require_finite 全库口径一致）；负肌酐物理上不可能，显式拒绝。
+    """
+    v = _require_finite(value_umol_L, "value_umol_L")
+    if v < 0:
+        raise ValueError("value_umol_L 不能为负")
+    return v / 88.4
 
 
 def _normalize_scr(value: float, unit: str) -> float:
@@ -229,6 +298,12 @@ def classify_ckd(
     if uacr_mg_g is not None:
         a = _acr_to_a(uacr_mg_g)
         albuminuria_source = "UACR"
+        if upcr_mg_g is not None:
+            # 2026-08-12（系统性审查，P3）：双指标同时传入时透明化——KDIGO 2024 以
+            # UACR 为准，但 UPCR 的忽略状态须显式标注供上游审计（此前静默丢弃，
+            # 审计无法知晓 UPCR 已提供却未参与分期）。
+            albuminuria_note = ("同时提供 UACR 与 UPCR：按 KDIGO 2024 以 UACR 为准，"
+                                "UPCR 未用于 A 分期。")
     elif upcr_mg_g is not None:
         # BUG-48（2026-08-12）：KDIGO 2024 白蛋白尿 A 分期**仅基于 UACR**。UPCR 反映尿总蛋白
         # （含球蛋白），与白蛋白不等价——肾病综合征等患儿 UPCR 显著高于 UACR，直接映射
@@ -270,9 +345,14 @@ def classify_ckd(
             "g": g,
             "a": a,
             "g_description": g_desc,
-            "a_description": a_desc.get(a) if a is not None and a_desc else None,
+            # 💭（2026-08-12 五包审查）：简化冗余条件——a_desc 仅当 a 非 None 时构建
+            # （BUG-67 后补），`and a_desc` 恒真，保留 `a is not None` 即可。
+            "a_description": a_desc.get(a) if a is not None else None,
             "albuminuria_source": albuminuria_source or None,
             "albuminuria_note": albuminuria_note,
+            # 2026-08-12（系统性审查，P3）：双指标同时传入时为 True——机器可读标注
+            # UPCR 被忽略（与 albuminuria_note 文本互补，供上游审计程序化判断）。
+            "upcr_ignored": (uacr_mg_g is not None and upcr_mg_g is not None),
             "risk_note": risk_note,
         },
     }
@@ -299,39 +379,145 @@ _LEVEL_RANK = {"L1": 3, "L2": 2, "L3": 1, "none": 0}
 
 _RULES_PATH = os.path.join(os.path.dirname(__file__), "data", "rules.json")
 _RULES: Optional[Dict[str, Any]] = None
+_RULES_VIEW: Optional[Mapping[str, Any]] = None
+# 2026-08-12（系统性审查，P2）：懒加载并发锁——FastMCP/多 worker 线程并发首次调用时
+# 防重复 I/O 与重复 JSON 解析（double-checked locking，GIL 下安全）。
+_RULES_LOCK = threading.Lock()
 
 
-def _load_rules() -> Dict[str, Any]:
-    global _RULES
+def _load_rules() -> Mapping[str, Any]:
+    global _RULES, _RULES_VIEW
     if _RULES is None:
-        try:
-            with open(_RULES_PATH, "r", encoding="utf-8") as f:
-                _RULES = json.load(f)
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"风险规则文件缺失：{_RULES_PATH}；请确认 data/rules.json 存在"
-            )
-        except json.JSONDecodeError as e:
+        with _RULES_LOCK:
+            if _RULES is None:
+                try:
+                    with open(_RULES_PATH, "r", encoding="utf-8") as f:
+                        _RULES = json.load(f)
+                except FileNotFoundError:
+                    # 2026-08-12（系统性审查）：异常消息只透出文件名（basename）不泄露服务端
+                    # 目录结构（与 clinical-data store 同口径）；完整路径仅留在服务端排障。
+                    raise FileNotFoundError(
+                        f"风险规则文件缺失：{os.path.basename(_RULES_PATH)}；请确认 data/rules.json 存在"
+                    )
+                except json.JSONDecodeError as e:
+                    raise ValueError(
+                        f"风险规则文件 JSON 解析失败：{os.path.basename(_RULES_PATH)}，{e}"
+                    )
+                # 四审（2026-08-12）：加载期规则结构校验（fail-closed，对齐 content
+                # _load_guides/_load_sops 的加载校验）——此前 rules.json 缺键/类型错
+                # 在运行时 KeyError（归 INTERNAL_ERROR 但无定位）或**静默误判**：
+                # level 未知值 rank=0（漏报危急）、operator 未知值 hit=False（漏报）、
+                # trend direction 非法值落 down 分支（方向反判）。配置错误必须在
+                # 加载期显式拒绝，不进入评估路径。
+                _validate_rules_schema(_RULES)
+                # 2026-08-12（系统性审查，P3）：加载时一次性归一化规则阈值类型——
+                # absolute/between 的 low/high 统一 float（int 配置 {"low":1} 在此转 1.0），
+                # 保证返回引用的展示契约（"[1.0, 2.0)"）在各配置来源下绝对一致，命中路径
+                # 无需再操心类型（_eval_rule 保留的 float() 为幂等防御，float(5.0) 返回原对象）。
+                for _r in _RULES.get("rules", []):
+                    if _r.get("type") == "absolute" and _r.get("operator") == "between":
+                        _r["low"] = float(_r["low"])
+                        _r["high"] = float(_r["high"])
+                # 2026-08-12（系统性审查，P2）：返回 MappingProxyType 顶层只读视图——
+                # 替代裸 dict 引用：类型层面表达只读契约，外部对**顶层键**的增删改
+                # （_RULES["rules"]=[...] 等）即刻 TypeError。注意嵌套结构（list/dict）
+                # 仍可变（Python 无深层不可变），深层防护依赖"公开 API 不暴露引用 +
+                # 调用方自律"（evaluate/list_rules/assess 返回值均为新建对象，已满足）。
+                _RULES_VIEW = MappingProxyType(_RULES)
+    return _RULES_VIEW
+
+
+# 规则 level 合法枚举（L1>L2>L3，_LEVEL_RANK 的合法键集合）
+_VALID_RULE_LEVELS = frozenset({"L1", "L2", "L3"})
+# absolute 单边运算符合法集
+_VALID_ABS_OPS = frozenset({"gt", "gte", "lt", "lte", "between"})
+# trend 方向合法集
+_VALID_TREND_DIRECTIONS = frozenset({"up", "down"})
+# 规则必填元数据键（缺任一即拒绝加载）
+_RULE_REQUIRED_KEYS = ("id", "name", "level", "type", "metric", "unit", "description")
+
+
+def _validate_rules_schema(rules_doc: Dict[str, Any]) -> None:
+    """规则库结构校验（fail-closed，四审 2026-08-12）。
+
+    在加载期一次性校验，杜绝运行时三种静默误判：
+    - level 非法值 → _LEVEL_RANK.get(...,0) 归 0（危急规则被静默降级为不触发）；
+    - absolute operator 非法值 → _eval_rule hit=False（漏报）；
+    - trend direction 非法值 → else 分支当 down 处理（方向反判）。
+    """
+    rules = rules_doc.get("rules")
+    if not isinstance(rules, list) or not rules:
+        raise ValueError("风险规则库缺少非空 'rules' 列表，拒绝加载")
+    for r in rules:
+        if not isinstance(r, dict):
+            raise ValueError(f"规则条目 {r!r} 非字典，拒绝加载")
+        missing = [k for k in _RULE_REQUIRED_KEYS if not str(r.get(k) or "").strip()]
+        if missing:
             raise ValueError(
-                f"风险规则文件 JSON 解析失败：{_RULES_PATH}，{e}"
-            )
-    return _RULES
+                f"规则 {r.get('id', '?')} 缺少必填键 {missing}，拒绝加载（fail-closed）")
+        if r["level"] not in _VALID_RULE_LEVELS:
+            raise ValueError(
+                f"规则 {r['id']} level={r['level']!r} 非法，必须是 {sorted(_VALID_RULE_LEVELS)}")
+        if r["type"] == "absolute":
+            op = r.get("operator")
+            if op not in _VALID_ABS_OPS:
+                raise ValueError(
+                    f"规则 {r['id']} operator={op!r} 非法，必须是 {sorted(_VALID_ABS_OPS)}")
+            if op == "between":
+                low, high = r.get("low"), r.get("high")
+                if not (isinstance(low, (int, float)) and isinstance(high, (int, float))
+                        and low < high):
+                    raise ValueError(
+                        f"规则 {r['id']} between 需 low < high 数值，收到 low={low!r} high={high!r}")
+            elif not isinstance(r.get("threshold"), (int, float)):
+                raise ValueError(
+                    f"规则 {r['id']} 单边 operator 需数值 threshold，收到 {r.get('threshold')!r}")
+        elif r["type"] == "trend_pct":
+            direction = r.get("direction")
+            if direction not in _VALID_TREND_DIRECTIONS:
+                raise ValueError(
+                    f"规则 {r['id']} direction={direction!r} 非法，必须是 up / down")
+            if "low_pct" in r or "high_pct" in r:
+                low_pct, high_pct = r.get("low_pct"), r.get("high_pct")
+                if not (isinstance(low_pct, (int, float)) and isinstance(high_pct, (int, float))
+                        and low_pct < high_pct):
+                    raise ValueError(
+                        f"规则 {r['id']} 区间型趋势需 low_pct < high_pct，收到 "
+                        f"low_pct={low_pct!r} high_pct={high_pct!r}")
+            elif not isinstance(r.get("threshold_pct"), (int, float)):
+                raise ValueError(
+                    f"规则 {r['id']} 单阈值趋势需数值 threshold_pct，收到 {r.get('threshold_pct')!r}")
+        else:
+            raise ValueError(
+                f"规则 {r['id']} type={r['type']!r} 非法，必须是 absolute / trend_pct")
 
 
 def _pct_change(new: float, old: float) -> float:
-    """相对变化百分比（正=升，负=降）。old<=0 或任一值为 NaN/Inf 视为无效。
+    """相对变化百分比（正=升，负=降）。old<=1e-9 或任一值为 NaN/Inf 视为无效。
 
     BUG-58（2026-08-12）：原 `old is None` 判断位于 float(old) 之后属死代码
     （None 会在 float() 抛 TypeError 提前返回）；且 NaN 穿透 `old <= 0` 比较后
     会带着 NaN 继续计算（虽被上层 pct != pct 过滤），显式拒绝更清晰。
+    2026-08-12（系统性审查，P1）：极小正基线（如 o=1e-321 的微量化验值/浮点误差）
+    使 (n-o)/o*100 产生 inf 或 1e300 级巨值——上层 `pct != pct` 只拦 NaN、拦不住
+    inf，命中趋势规则后 `round(abs(pct),1)` 抛 OverflowError 击穿 fail-closed。
+    ① 基线阈值收紧至 o<=1e-9（正常化验值量级远大于此，不受影响）；
+    ② 计算结果二次有限性校验（防分母非极小但分子极端导致的 inf/nan）。
     """
     try:
         n, o = float(new), float(old)
     except (ValueError, TypeError):
         return float("nan")
-    if math.isnan(n) or math.isnan(o) or math.isinf(n) or math.isinf(o) or o <= 0:
+    # 2026-08-12（系统性审查，P1 二修）：基线阈值 1e-9 → 1e-6——o=1e-8（>1e-9）时
+    # (n-o)/o*100 仍可达 1e10 级夸张百分比（非 inf，能穿过上轮 isinf 拦截），命中
+    # 趋势规则产生 AKI 类误报。o <= 1e-6 同时覆盖**负数基线**（化验值物理上不可能为负，
+    # 视为脏值拒绝，防 down 规则误报）；正常化验值量级远大于 1e-6，零误伤。
+    if math.isnan(n) or math.isnan(o) or math.isinf(n) or math.isinf(o) or o <= 1e-6:
         return float("nan")
-    return (n - o) / o * 100.0
+    res = (n - o) / o * 100.0
+    if math.isnan(res) or math.isinf(res):
+        return float("nan")
+    return res
 
 
 def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
@@ -365,9 +551,17 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
         op_label = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}.get(op, op)
         return {
             "metric": metric,
-            "observed": v,
-            "threshold": (rule.get("low"), rule.get("high")) if op == "between"
-                         else f"{op_label} {rule['threshold']}",
+            # 2026-08-12（系统性审查）：observed 统一 round 2 位——umol/L→mg/dL 换算
+            # 可能产生长浮点（100/88.4=1.131221719...），直出审计/医生端展示体验差。
+            "observed": round(v, 2),
+            # 2026-08-12（系统性审查）：threshold 统一为 str——此前 between 返回
+            # Tuple[low, high]（(1.0,2.0)）而单边/趋势返回 str（">= 1.5"/"up [30,50)%"），
+            # 下游强类型解析器（TS/Pydantic DTO）反序列化会因类型漂移崩溃。
+            # 2026-08-12（系统性审查，P2）：float() 幂等防御——_load_rules 加载时已把
+            # between 的 low/high 归一化为 float，此处 float() 对 float 输入返回原对象
+            # （零开销），仅防本函数被直接调用时收到手工构造的 int 配置。
+            "threshold": (f"[{float(rule['low'])}, {float(rule['high'])})" if op == "between"
+                          else f"{op_label} {rule['threshold']}"),
             "unit": rule["unit"],
         }
     if rtype == "trend_pct":
@@ -389,6 +583,12 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
             if "low_pct" in rule:
                 # 下降区间镜像上升 [low, high)：high 端转负后开放，low 端转负后闭合。
                 # 例 [30, 50)→(-50, -30]，即下降 30% 命中边界而 50% 不命中。
+                # 2026-08-12（系统性审查）：边界契约确认——本实现与 [low,high) 半开区间
+                # 语义严格一致：pct=-50（下降 50%）归入下一阶梯（(-70,-50]），本阶梯不命中；
+                # pct=-30 恰好命中本阶梯下界。**配置方须全库统一 [low, high) 半开区间**
+                # 语义（low 闭合、high 开放）定义相邻下降区间（如 [30,50) 与 [50,70)），
+                # 相邻阶梯在临界点无缝衔接（下降 pct=-high 恒归下一阶梯），不会出现
+                # "两侧都不命中（漏报）或两侧都命中（误报）"。
                 hit = -rule["high_pct"] < pct <= -rule["low_pct"]
             else:
                 hit = pct <= -rule["threshold_pct"]
@@ -402,7 +602,11 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
                           else f"<= -{rule['threshold_pct']}%")
         return {
             "metric": metric,
-            "observed": round(pct, 1),
+            # 2026-08-12（系统性审查，P3）：down 方向 observed 取绝对值——_pct_change
+            # 下降为负（-35.0），与阈值描述（"down [30%, 50%)"）同框展示时负数直观上
+            # "不在区间内"引发 UI/临床困惑。方向语义已由 threshold 文本承载，取绝对值
+            # 不丢信息；up 方向 pct 恒正，abs 无影响。
+            "observed": round(abs(pct), 1),
             "threshold": thresh_str,
             "unit": "%",
         }
@@ -428,6 +632,18 @@ _LAB_ALIAS_TO_RULE: dict[str, tuple[str, float]] = {
     # P1 的 bun_mmol_L（mmol/L 尿素氮）须 ×2.8 换算，原系数 1.0 会在未来新增 bun
     # 规则时产生 2.8 倍偏差（当前规则库尚无 bun 规则，属隐患修复）。
     "bun_mmol_L": ("bun", 2.8),
+    # 2026-08-12（系统性审查，P1）：补 bun mg/dL 完整键名变体——P1 输入模型/别名表
+    # 存在 bun_mg_dL（reference.py:219），编排层可能把该键直传 new_labs；此前无法映射
+    # 为规则短名 "bun" → assess_clinical_status 的 `"bun" in norm_inputs` 补齐逻辑
+    # 失效 → method 自动推理看不到 BUN，静默降级 bedside2009（失去 revised2009 精算）。
+    # 两变体（全小写 / P1 大写 L 风格）系数均为 1.0（mg/dL 与规则单位一致）。
+    "bun_mg_dl": ("bun", 1.0),
+    "bun_mg_dL": ("bun", 1.0),
+    # 2026-08-12（系统性审查）：补 uacr/upcr 完整键名映射——P1 返回 uacr_mg_g/upcr_mg_g。
+    # 当前规则库尚无蛋白尿规则（白蛋白尿 A 分期走 classify_ckd），映射为防未来规则
+    # 扩展 + 键名规范化一致性（与 scr/k 等同模式，系数 1.0）。
+    "uacr_mg_g": ("uacr", 1.0),
+    "upcr_mg_g": ("upcr", 1.0),
 }
 
 
@@ -436,16 +652,38 @@ def _normalize_labs(labs: Optional[Dict[str, float]]) -> Optional[Dict[str, floa
 
     已用短名的输入原样保留；完整键名在短名缺失时转换并换算单位。
     返回新 dict，不修改调用方对象。
+
+    2026-08-12（系统性审查，P0）：对全部输入值强校验 `_require_finite`——此前 NaN/Inf
+    （如 {"k": float("nan")}）会静默穿透比较（nan > 5.5 恒 False）→ 规则漏检 →
+    overall_level="none" 给临床"无风险"假象（fail-open，违背 BUG-58 的 fail-closed 原则）。
+    非法值抛 ValueError（冒泡 server._invalid 归 INVALID_INPUT），绝不静默放行。
+    2026-08-12（系统性审查）：入口类型强校验——LLM/编排层可能把嵌套对象序列化为 JSON
+    字符串直传（如 '{"scr": 1.2}'）；FastMCP/pydantic 参数校验层会拦截该形态，但编排层
+    **绕过 FastMCP 直接 import core 调用**时（core 为纯函数库），str 会走 labs.items()
+    抛 AttributeError（内部 bug 误报）。显式拒绝非 dict（fail-closed ValueError）。
     """
+    if labs is None:
+        return None
+    if not isinstance(labs, dict):
+        raise ValueError(
+            f"labs 必须为 dict（键→数值映射），实际为 {type(labs).__name__}；"
+            "不接受 JSON 字符串等其它形态")
     if not labs:
         return labs
-    out: Dict[str, float] = dict(labs)
+    out: Dict[str, float] = {}
+    for k, v in labs.items():
+        out[k] = _require_finite(v, f"labs[{k!r}]")
+    # 2026-08-12（系统性审查，P2）：完整键名匹配大小写容错——`_normalize_scr` 已对单位
+    # lower 化，但此处键名此前严格区分大小写：上游/P1 若传 Scr_umol_L、bun_mg_DL 等变体
+    # 无法识别 → scr/bun 相关规则静默跳过 → overall_level="none" 假无风险。现用 lower_map
+    # 归一化查找（短名仍精确匹配原样保留，不受影响）。
+    lower_map = {k.lower(): k for k in out}
     for full_key, (short, factor) in _LAB_ALIAS_TO_RULE.items():
-        if full_key in out and short not in out:
-            try:
-                out[short] = float(out[full_key]) * factor
-            except (TypeError, ValueError):
-                continue
+        matched_key = lower_map.get(full_key.lower())
+        if matched_key is not None and short not in out:
+            # 完整键名已由 _require_finite 校验为有限数，换算必然成功（原 try/except
+            # 静默跳过改为强校验后不再需要——脏值在上一循环已被拦截）
+            out[short] = round(out[matched_key] * factor, 4)
     return out
 
 
@@ -500,10 +738,30 @@ def evaluate_risk_rules(
         if _LEVEL_RANK.get(m["level"], 0) > _LEVEL_RANK.get(overall, 0):
             overall = m["level"]
 
+    # 2026-08-12（系统性审查，P3）：命中列表按风险等级降序（L1 危急优先）——rules.json
+    # 文件顺序非等级序（如 R-01 L1 后紧跟 R-08 L3），医生/前端审阅 matched_rules 时
+    # 应先见危急项再见低危项。overall_level 计算与顺序无关，此排序纯展示层无副作用。
+    matched.sort(key=lambda m: _LEVEL_RANK.get(m["level"], 0), reverse=True)
+
+    # 四审（2026-08-12）：空输入显式提示——编排层直接调 evaluate_risk_rules（绕过
+    # DAG）传空/缺失 new_labs 时，overall_level="none" 会给"已全面评估且无风险"的
+    # 假象；与 DAG 的 risk_completeness 同精神，函数级透明化（DAG 场景 new_labs
+    # 非空，此分支不触发）。
+    evaluation_note = None
+    if not new_labs:
+        evaluation_note = (
+            "未提供任何化验指标（new_labs 为空），规则引擎未评估任何规则；"
+            "overall_level=none 不代表无风险，请补充化验数据后重评。")
+
     # 对比：仅展示，不兜底
     delta_note = "无历史等级对照"
     if prior_level:
-        if prior_level == overall:
+        # 2026-08-12（系统性审查）：prior_level 非法值（如 "UNKNOWN"）此前会落
+        # _LEVEL_RANK.get(...,0)=0 并输出"较历史等级 UNKNOWN 降至 none"的语义混乱文案——
+        # 强制校验合法枚举 {"L1","L2","L3","none"}，非法值忽略对比（不误导）。
+        if prior_level not in _LEVEL_RANK:
+            delta_note = f"历史等级 {prior_level!r} 无效，已忽略对比"
+        elif prior_level == overall:
             delta_note = f"与历史等级 {prior_level} 持平"
         elif _LEVEL_RANK[overall] > _LEVEL_RANK.get(prior_level, 0):
             delta_note = f"较历史等级 {prior_level} 升高至 {overall}"
@@ -516,6 +774,7 @@ def evaluate_risk_rules(
             "caller": caller,  # BUG-34 审计字段
             "matched_rules": matched,
             "overall_level": overall,
+            "evaluation_note": evaluation_note,  # 四审：空输入/未评估的显式提示
             "prior_comparison": {
                 "prior_level": prior_level,
                 "current_level": overall,
@@ -526,8 +785,14 @@ def evaluate_risk_rules(
     }
 
 
-def list_rules() -> List[Dict[str, Any]]:
-    """返回规则清单（不含评估逻辑）。"""
+def list_rules() -> Dict[str, Any]:
+    """返回规则清单（不含评估逻辑）。
+
+    2026-08-12（系统性审查）：签名修正为 Dict 信封——此前声明 List[Dict] 但实际返回
+    {"ok": true, "data": {"rules": [...]}}，类型检查器报错且上游按 List 索引会 KeyError: 0。
+    """
+    caller = get_caller()
+    enforce_read(MCP_NAME)
     rules_doc = _load_rules()
     out = []
     for r in rules_doc["rules"]:
@@ -536,7 +801,9 @@ def list_rules() -> List[Dict[str, Any]]:
         if r["type"] == "absolute":
             entry["criterion"] = (f"{r['operator']} {r.get('threshold')}"
                                   if r["operator"] != "between"
-                                  else f"[{r['low']}, {r['high']})")
+                                  # 2026-08-12（系统性审查，P2）：float() 幂等防御——
+                                  # _load_rules 加载时已归一化，此处与 _eval_rule 同口径
+                                  else f"[{float(r['low'])}, {float(r['high'])})")
         else:
             entry["criterion"] = (f"{r['direction']} {r.get('threshold_pct', '')}%"
                                   if "low_pct" not in r
@@ -552,6 +819,10 @@ def explain_verdict(evaluation: Dict[str, Any]) -> Dict[str, Any]:
     BUG-58（2026-08-12）：显式失败信封（{ok:false}）与非 dict 入参直接拒绝——
     此前失败信封会被误读为"无规则命中"，掩盖评估失败的事实。
     """
+    # 2026-08-12（系统性审查）：补鉴权——本函数与 list_rules 是模块内仅有的两个
+    # 未走 enforce_read 的对外函数（server 工具层同样无 enforce），矩阵收紧将失效。
+    caller = get_caller()
+    enforce_read(MCP_NAME)
     if not isinstance(evaluation, dict):
         raise ValueError(f"无法解释无效的评估结果：{evaluation!r}（需要评估结果 dict）")
     if evaluation.get("ok") is False:
@@ -560,7 +831,34 @@ def explain_verdict(evaluation: Dict[str, Any]) -> Dict[str, Any]:
     data = evaluation.get("data")
     payload = data if isinstance(data, dict) else evaluation
     chain = []
-    for m in payload.get("matched_rules", []):
+    # BUG（2026-08-12，P0）：assess_clinical_status 输出的命中规则键名为
+    # risk_matched_rules，而 evaluate_risk_rules 用 matched_rules——直接把 DAG 结果
+    # 传给 explain_verdict 会静默回退"无规则命中"，高危病人被误判"未触发任何规则"。
+    # 双键名兼容（元素结构相同：均来自 evaluate_risk_rules 的 matched_rules）。
+    # 2026-08-12（系统性审查，P3）：显式按键存在性提取——此前 `get("matched_rules") or
+    # get("risk_matched_rules", [])` 依赖 Python Falsy：matched_rules 为 []（已评估但
+    # 无命中）时也会强算右侧表达式，属隐式类型评估；现保留"键存在且为 [] = 明确无命中"
+    # 语义，仅当键缺失或为 None 时回退另一键名（[] 不再被 or 吞掉）。
+    matched_rules = payload.get("matched_rules")
+    if matched_rules is None:
+        matched_rules = payload.get("risk_matched_rules", [])
+    # 2026-08-12（系统性审查，P2）：非法 evaluation 的结构校验——LLM/客户端可能传入
+    # 残缺/错误类型的 matched_rules（如 [{"id":"R-01"}] 缺 name、元素为 str、整体非 list）。
+    # 此前直接索引 m["id"]/m["name"] 抛 KeyError/TypeError → _invalid 归 INTERNAL_ERROR，
+    # 客户端输入错误触发服务端误报监控。现显式结构校验：非法 → ValueError（→ INVALID_INPUT），
+    # 与"内部代码 bug（键名写错）仍抛 KeyError → INTERNAL_ERROR"的监控语义保持区分。
+    if not isinstance(matched_rules, list):
+        raise ValueError(
+            f"无法解释无效的评估结果：matched_rules 应为列表，实际为 {type(matched_rules).__name__}"
+        )
+    _MATCHED_RULE_FIELDS = ("id", "name", "level", "observed", "threshold", "unit", "description")
+    for i, m in enumerate(matched_rules):
+        if not isinstance(m, dict):
+            raise ValueError(f"matched_rules[{i}] 应为 dict，实际为 {type(m).__name__}")
+        missing = [f for f in _MATCHED_RULE_FIELDS if f not in m]
+        if missing:
+            raise ValueError(f"matched_rules[{i}] 缺少字段: {missing}")
+    for m in matched_rules:
         chain.append({
             "rule_id": m["id"],
             "rule_name": m["name"],
@@ -586,6 +884,7 @@ def assess_clinical_status(
     serum_creatinine_mgdl: float,
     serum_creatinine_unit: str = "mg_dL",
     is_preterm: bool = False,
+    sex: Optional[str] = None,
     uacr_mg_g: Optional[float] = None,
     upcr_mg_g: Optional[float] = None,
     bun_mg_dl: Optional[float] = None,
@@ -598,8 +897,9 @@ def assess_clinical_status(
     """一键评估 CKD 临床状态（eGFR + 分期 + 风险评分 DAG）。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1）。
-    method=None 时自动推理（有 bun → revised2009，有 k_value → classic，否则 bedside2009）；
-    传入 method 则优先使用传入值。
+    method=None 时自动推理（有 bun → revised2009，有 k_value → classic，
+    <1y 早产儿 → classic[k=0.33]，否则 bedside2009）；传入 method 则优先使用传入值。
+    sex（M/F/male/female/男/女）仅 method="classic" 且 ≥13y 时生效（女性 k=0.55）。
     serum_creatinine_unit（BUG-40 修复）：mg_dL 默认 / umol_L 自动 ÷88.4——P1 get_labs
     返回 scr_umol_L（µmol/L），直接透传会导致 eGFR 与风险规则的 scr 判断同时错 88 倍。
     BUG-34：显式取 caller 回写审计字段。
@@ -610,26 +910,77 @@ def assess_clinical_status(
     caller = get_caller()  # BUG-34：显式取 caller 回写审计字段
     enforce_read(MCP_NAME)
 
+    # 2026-08-12（系统性审查，P1）：sex 入口统一清洗为 "male"/"female"/None——
+    # 与 calc 内部归一化幂等，保证全链路口径一致（审计/日志/sex_note 单一事实源）。
+    sex = _normalize_sex(sex)
+
+    # 2026-08-12（系统性审查，P2）：弱必填形参 Fail-Fast 强校验——uacr/upcr/bun/k_value
+    # 此前在 labs 构建中途才被 _require_finite 拦截，非法值（NaN/Inf）会带着进入中间
+    # 计算（method 自动推理等）才报错；现于入口统一校验（与 age/height 同口径），
+    # 非法输入即刻失败（INVALID_INPUT），不进入任何计算。scr/egfr 由 calc 内部保证有限。
+    if uacr_mg_g is not None:
+        uacr_mg_g = _require_finite(uacr_mg_g, "uacr_mg_g")
+    if upcr_mg_g is not None:
+        upcr_mg_g = _require_finite(upcr_mg_g, "upcr_mg_g")
+    if bun_mg_dl is not None:
+        bun_mg_dl = _require_finite(bun_mg_dl, "bun_mg_dl")
+    if k_value is not None:
+        k_value = _require_finite(k_value, "k_value")
+
     # BUG-40：DAG 内统一归一化肌酐到 mg/dL（eGFR 公式与风险规则 scr 判断共用同一值）
     scr_mgdl = _normalize_scr(serum_creatinine_mgdl, serum_creatinine_unit)
 
+    # 2026-08-12（系统性审查，P2）：显式形参与 new_labs 字典的双向对齐——调用方若只在
+    # new_labs 传 {"bun"/"uacr"/"upcr"} 而未传形参，此前会导致：① method 自动推理看不到
+    # BUN → 误降级 bedside2009；② classify_ckd 收不到 uacr/upcr → 白蛋白尿 A 分期丢失。
+    # 形参为 None 时从归一化 new_labs 补齐（_normalize_labs 已做有限性强校验，脏值在此抛错）。
+    norm_inputs = _normalize_labs(new_labs) or {}
+    if bun_mg_dl is None and "bun" in norm_inputs:
+        bun_mg_dl = norm_inputs["bun"]
+    if uacr_mg_g is None and "uacr" in norm_inputs:
+        uacr_mg_g = norm_inputs["uacr"]
+    if upcr_mg_g is None and "upcr" in norm_inputs:
+        upcr_mg_g = norm_inputs["upcr"]
+
     # 自动识别 Schwartz 方法（显式传入优先）
+    warnings: List[str] = []
     if method is None:
         if bun_mg_dl is not None:
             method = "revised2009"
+            # 2026-08-12（系统性审查）：bun 与 k_value 同时给出且未显式 method 时，
+            # revised2009 用固定系数 0.413、k_value 被静默丢弃——显式标注，不悄悄吞参。
+            if k_value is not None:
+                warnings.append(
+                    "同时提供 bun_mg_dl 与 k_value 且未指定 method：按 revised2009"
+                    "（固定系数 0.413）计算，k_value 被忽略；如需自定义 k 值请显式"
+                    "method='classic' 并传 k_value。")
         elif k_value is not None:
             method = "classic"
+        elif is_preterm and age_years < 1:
+            # 2026-08-12（系统性审查，P1）：早产儿自动推理修正——此前 is_preterm=True
+            # 且无 bun/k_value 时落到 bedside2009（固定 k=0.413），早产 k=0.33 静默失效，
+            # eGFR 高估约 25%（0.413/0.33），G4 可能误判 G3，违背 BUG-47 防护初衷。
+            # <1y 早产儿自动切经典式（k=0.33 生效），与 BUG-47 口径一致。
+            method = "classic"
+            warnings.append("检测到早产（is_preterm=True 且 <1 岁）：自动采用经典式 "
+                            "k=0.33；如需床旁式请显式 method='bedside2009'。")
         else:
             method = "bedside2009"
 
     egfr_r = calc_egfr_schwartz(
         age_years=age_years,
         height_cm=height_cm,
-        serum_creatinine_mgdl=scr_mgdl,
+        # 2026-08-12（系统性审查，P2）：透传**原始**肌酐值与单位——此前传预归一化的
+        # scr_mgdl + 默认 unit="mg_dL"，calc 返回的审计字段 scr_unit_used 恒为 "mg/dL"，
+        # 用户原始输入 umol_L 的追溯信息被抹除。calc 内部会自行归一化（_normalize_scr），
+        # labs["scr"] 仍用下方归一化值，两者互不影响。
+        serum_creatinine_mgdl=serum_creatinine_mgdl,
+        serum_creatinine_unit=serum_creatinine_unit,
         method=method,
         bun_mg_dl=bun_mg_dl,
         k_value=k_value,
         is_preterm=is_preterm,
+        sex=sex,
     )
     # BUG-67 后补（2026-08-12）：防御性兜底——calc_egfr_schwartz 当前对非法输入抛 ValueError
     # （冒泡到 server._invalid 归 INVALID_INPUT），但 DAG 内部直接索引 egfr_r["data"] 依赖
@@ -644,18 +995,22 @@ def assess_clinical_status(
     )
     risk_r: Dict[str, Any] = {}
     # 始终以本轮计算的 eGFR + 已传入参数打底做风险评估，不因未传 new_labs 而静默跳过
-    labs = dict(new_labs) if new_labs else {}
-    labs["scr"] = scr_mgdl
-    labs["egfr"] = egfr_r["data"]["egfr"]
-    if bun_mg_dl is not None:
-        labs["bun"] = bun_mg_dl
-    if uacr_mg_g is not None:
-        labs["uacr"] = uacr_mg_g
-    if upcr_mg_g is not None:
-        labs["upcr"] = upcr_mg_g
+    # 2026-08-12（系统性审查，P3）：labs 直接基于**已归一化**的 norm_inputs 构造——
+    # 此前基于原始 new_labs 再调 _normalize_labs(labs) 重复一遍完整键名换算+遍历。
+    # norm_inputs 已含完整键名→短名转换与 _require_finite 强校验；此处仅并入 DAG
+    # 计算的短名键（scr/egfr，calc 已保证有限）与形参键（bun/uacr/upcr，入口已
+    # Fail-Fast 校验为有限值或 None；形参优先于 new_labs 值），无需重复校验。
+    labs = dict(norm_inputs)
+    for k, v in (("scr", scr_mgdl), ("egfr", egfr_r["data"]["egfr"]),
+                 ("bun", bun_mg_dl), ("uacr", uacr_mg_g), ("upcr", upcr_mg_g)):
+        if v is not None:
+            labs[k] = v
+    # 2026-08-12（系统性审查，P3）：prior_labs 归一化前移一次，evaluate 与趋势完整性
+    # 校验共用（evaluate 内部再归一化幂等无副作用）——此前两处各归一化一遍。
+    norm_prior = _normalize_labs(prior_labs)
     risk_r = evaluate_risk_rules(
         new_labs=labs,
-        prior_labs=prior_labs,
+        prior_labs=norm_prior,
         prior_level=prior_level,
     )
     risk_data = risk_r.get("data", {}) if risk_r.get("ok") else {}
@@ -663,11 +1018,18 @@ def assess_clinical_status(
     # rules.json 全部规则依赖 ca/egfr/hb/k/p/scr/ua，若调用方未传 new_labs，
     # labs 仅含 scr+egfr（+可选 bun/uacr/upcr），电解质/贫血规则会被静默跳过，
     # 直接返回 overall_level="none" 会给临床"已全面评估且无风险"的假象。
-    rule_metrics = sorted({rule["metric"] for rule in _load_rules()["rules"]})
+    # 2026-08-12（系统性审查，P2）：合并规则读取——此前 rule_metrics / trend_rules
+    # 各调一次 _load_rules()（每次 deepcopy），单次 DAG 连同 evaluate 内部共 3 次深拷贝；
+    # 高并发下徒增临时对象与 GC 压力。此处读一次复用（evaluate_risk_rules 内部因函数
+    # 独立契约仍各读一次，DAG 自身从 3 次降到 2 次）。
+    rules_doc = _load_rules()
+    rule_metrics = sorted({rule["metric"] for rule in rules_doc["rules"]})
     # BUG-58（2026-08-12）：覆盖度统计须基于归一化键名——调用方传 P1 完整键名
     # （k_mmol_L、hb_g_L 等）时，原始 labs 不含短名，直接求差集会误报"未覆盖
     # K/Hb"，与实际已命中的规则矛盾（用户审查发现）。
-    normalized_labs = _normalize_labs(labs) or {}
+    # 2026-08-12（系统性审查，P3）：labs 已基于 norm_inputs 构造（归一化完成），
+    # 直接复用，不再重复 _normalize_labs(labs)（省一次完整遍历）。
+    normalized_labs = labs
     missing_metrics = sorted(set(rule_metrics) - set(normalized_labs))
     covered_metrics = sorted(set(rule_metrics) - set(missing_metrics))
     if missing_metrics:
@@ -684,6 +1046,23 @@ def assess_clinical_status(
             "missing_metrics": [],
             "note": "本轮已覆盖规则引擎全部依赖指标。",
         }
+    # 2026-08-12（系统性审查）：覆盖度假象修正——rules.json 含 trend_pct 规则
+    # （R-01/R-08 scr 环比、R-07 egfr 环比），它们依赖 prior_labs 历史对照；
+    # 若未传 prior_labs，missing_metrics 即使为空，"已全面覆盖"也是假象
+    # （趋势规则被 _eval_rule 静默跳过）。显式提示，不给临床"已全面评估"的承诺。
+    # 2026-08-12（系统性审查，P2 修正上轮粗判）：趋势规则完整性须**精确校验其依赖的
+    # 具体指标**在 prior_labs 中是否覆盖——此前 len(prior_labs)>0 只判"非空"：调用方传
+    # prior_labs={"scr": 1.0} 时 has_prior=True，但 R-07 依赖 egfr（prior 缺 egfr）仍被
+    # 静默跳过且无提示。现按趋势规则 metric 集（scr/egfr）逐一核对归一化 prior_labs。
+    trend_rules = [r for r in rules_doc["rules"] if r["type"] == "trend_pct"]
+    if trend_rules:
+        required_prior = {r["metric"] for r in trend_rules}
+        norm_prior = norm_prior or {}  # 复用前移的归一化结果（评估与完整性校验共用）
+        missing_prior = sorted(required_prior - set(norm_prior))
+        if missing_prior:
+            risk_completeness["note"] += (
+                f"（注意：prior_labs 缺失 {missing_prior} 历史对照，对应动态趋势类规则"
+                "（R-01/R-07/R-08）未触发评估，overall_level 不含相关急性恶化判断。）")
     return {
         "ok": True,
         "data": {
@@ -691,6 +1070,12 @@ def assess_clinical_status(
             "egfr": egfr_r["data"]["egfr"],
             "egfr_unit": egfr_r["data"]["unit"],
             "egfr_method": egfr_r["data"]["method"],
+            # 四审（2026-08-12）：透出计算层警示——calc 的 note（早产 k 覆盖提示、
+            # BUN 静默丢弃提示、经典式参数说明等）与 classify 的 risk_note（进展风险
+            # 提示）此前仅在底层函数返回，DAG 结果里不可见；医生看一键评估结论会漏掉
+            # 关键口径警示（如"is_preterm 用床旁式无早产修正"）。
+            "egfr_note": egfr_r["data"].get("note"),
+            "ckd_risk_note": ckd_r["data"].get("risk_note"),
             "ckd_stage": ckd_r["data"]["stage"],
             "ckd_g_stage": ckd_r["data"]["g"],
             "ckd_a_stage": ckd_r["data"].get("a"),
@@ -700,6 +1085,8 @@ def assess_clinical_status(
             "prior_comparison": risk_data.get("prior_comparison"),
             # BUG-26 修复：风险扫描覆盖完整性声明（防"未全面评估却显示无风险"的假象）
             "risk_completeness": risk_completeness,
+            # 2026-08-12：DAG 级警告（如 k_value 被忽略）
+            "warnings": warnings,
         },
     }
 
