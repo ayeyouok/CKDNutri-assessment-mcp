@@ -214,6 +214,10 @@ def calc_egfr_schwartz(
             note += "（提供了 BUN 但床旁式未使用，如需 BUN 修订请用 method='revised2009'）"
 
     egfr = round(egfr, 1)
+    # 2026-08-13（二审残余风险）：round(egfr,1) 先于分期——89.96→90.0 会翻 G2→G1，
+    # 且 DAG 用同一舍入值喂 R-07。已决策保留（0.1 精度对临床分期的边界影响可接受），
+    # 在 note 显式标注舍入口径，供医生/审计知悉。
+    note += " eGFR 已四舍五入至 0.1 ml/min/1.73m2。"
     pediatric_caveat = (
         "注意：<2 岁婴儿 eGFR 参考范围低于年长儿（正常可低至 60–90），"
         "G1/G2 阈值在婴儿期需结合月龄与生长曲线解读。"
