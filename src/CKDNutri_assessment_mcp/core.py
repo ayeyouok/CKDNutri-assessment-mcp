@@ -467,7 +467,17 @@ def _load_rules() -> Mapping[str, Any]:
                 # level 未知值 rank=0（漏报危急）、operator 未知值 hit=False（漏报）、
                 # trend direction 非法值落 down 分支（方向反判）。配置错误必须在
                 # 加载期显式拒绝，不进入评估路径。
-                _validate_rules_schema(_RULES)
+                # A-B1 修复（2026-08-14）：校验失败必须**重置缓存再抛**——此前
+                # `_RULES = json.load(...)` 在校验前赋值，schema 校验失败后 `_RULES`
+                # 非 None 但 `_RULES_VIEW` 仍为 None，模块被投毒：后续所有调用跳过
+                # 加载直接返回 None（真实配置错误被包装成 INTERNAL_ERROR 且进程内
+                # 永不恢复）。现在校验/归一化失败时 `_RULES = None`，下次调用重新
+                # 读取并再次校验（修复配置后自动恢复）。
+                try:
+                    _validate_rules_schema(_RULES)
+                except Exception:
+                    _RULES = None
+                    raise
                 # 2026-08-12（系统性审查，P3）：加载时一次性归一化规则阈值类型——
                 # absolute/between 的 low/high 统一 float（int 配置 {"low":1} 在此转 1.0），
                 # 保证返回引用的展示契约（"[1.0, 2.0)"）在各配置来源下绝对一致，命中路径
@@ -755,7 +765,14 @@ def _normalize_labs(labs: Optional[Dict[str, float]]) -> Optional[Dict[str, floa
         return labs
     out: Dict[str, float] = {}
     for k, v in labs.items():
-        out[k] = _require_finite(v, f"labs[{k!r}]")
+        fv = _require_finite(v, f"labs[{k!r}]")
+        # A-B2 修复（2026-08-14）：规则路径物理区间校验（fail-closed，对齐 eGFR 计算
+        # 路径）——此前 {"hb": -10} 触发"重度贫血 R-04"、负 eGFR 参与 AKI 判定，
+        # 负值/荒谬值物理不可能却静默参与临床判定（同包两套校验深度）。生化浓度
+        # 指标一律 ≥ 0；负值显式拒绝（冒泡 server._invalid 归 INVALID_INPUT）。
+        if fv < 0:
+            raise ValueError(f"labs[{k!r}] 必须 >= 0（生化指标物理上不可能为负），收到 {fv!r}")
+        out[k] = fv
     # 2026-08-12（系统性审查，P2）：完整键名匹配大小写容错——`_normalize_scr` 已对单位
     # lower 化，但此处键名此前严格区分大小写：上游/P1 若传 Scr_umol_L、bun_mg_DL 等变体
     # 无法识别 → scr/bun 相关规则静默跳过 → overall_level="none" 假无风险。现用 lower_map
@@ -767,6 +784,14 @@ def _normalize_labs(labs: Optional[Dict[str, float]]) -> Optional[Dict[str, floa
             # 完整键名已由 _require_finite 校验为有限数，换算必然成功（原 try/except
             # 静默跳过改为强校验后不再需要——脏值在上一循环已被拦截）
             out[short] = round(out[matched_key] * factor, 4)
+    # A-B5 修复（2026-08-14）：**短名键也大小写容错**——docstring 声称"键名匹配不区分
+    # 大小写"，但此前只对完整键名做 lower 映射，短名（scr/k/hb）大写传入（如 "HB"）→
+    # 规则静默跳过 → overall_level="none" 假象。合法短名集合 lower 后归一化到规范短名。
+    _short_set = {short for _, (short, _f) in _LAB_ALIAS_TO_RULE.items()}
+    for key in list(out.keys()):
+        lk = key.lower()
+        if lk in _short_set and lk != key:
+            out[lk] = out.pop(key)
     return out
 
 

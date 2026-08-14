@@ -88,6 +88,7 @@ def assess_clinical_status_tool(
     new_labs: Optional[dict[str, float]] = None,
     prior_labs: Optional[dict[str, float]] = None,
     prior_level: Optional[Literal["L1", "L2", "L3", "none"]] = None,
+    dialysis_mode: Optional[Literal["none", "hemodialysis", "peritoneal"]] = None,
 ) -> dict[str, Any]:
     """一键评估：eGFR→CKD 分期→风险等级 完整链路。
 
@@ -114,6 +115,10 @@ def assess_clinical_status_tool(
 
     出参：{egfr, egfr_unit, egfr_method, ckd_stage, risk_level, risk_matched_rules,
     risk_completeness, warnings} 全链路聚合。
+
+    dialysis_mode（可选，A-S1 修复 2026-08-14）：none / hemodialysis / peritoneal——
+    eGFR<15 且透析时分期标注 G5D（此前工具入口缺该参数，透析患儿经 MCP 评估
+    永远返回 G5 而非 G5D，测试仅覆盖 core 层恰好掩盖）。
     """
     try:
         return assess_clinical_status(
@@ -125,6 +130,7 @@ def assess_clinical_status_tool(
             bun_mg_dl=bun_mg_dl, k_value=k_value,
             method=method,
             new_labs=new_labs, prior_labs=prior_labs, prior_level=prior_level,
+            dialysis_mode=dialysis_mode,
         )
     except Exception as exc:
         return _invalid(exc)
