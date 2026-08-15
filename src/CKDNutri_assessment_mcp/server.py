@@ -61,7 +61,7 @@ def assess_clinical_status_tool(
     upcr_mg_g: Optional[float] = None,
     bun_mg_dl: Optional[float] = None,
     k_value: Optional[float] = None,
-    method: Optional[Literal["bedside2009", "revised2009", "classic"]] = None,
+    method: Optional[Literal["bedside2009", "classic"]] = None,  # M-1：revised2009 假公式已移除（CKiD 组合式需胱抑素 C，未实现）
     new_labs: Optional[dict[str, float]] = None,
     prior_labs: Optional[dict[str, float]] = None,
     prior_level: Optional[Literal["L1", "L2", "L3", "none"]] = None,

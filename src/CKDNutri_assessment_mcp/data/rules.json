@@ -35,13 +35,13 @@
   {
    "id": "R-02",
    "name": "高钾血症",
-   "level": "L1",
+   "level": "L2",
    "type": "absolute",
    "metric": "k",
    "operator": "gte",
    "threshold": 5.5,
    "unit": "mmol/L",
-   "description": "血钾 >= 5.5 mmol/L（含 5.5，KDIGO 降钾阈值；与 R-10 上界衔接，消除 5.5 边界空隙）"
+   "description": "血钾 >= 5.5 mmol/L（含 5.5，KDIGO 2024 降钾处理阈值；非危急——L1 危急保留 R-03 K>6.5）。M-5（2026-08-15）：由 L1 降 L2，避免 G3+ 患儿 K 5.6 即收危急通知"
   },
   {
    "id": "R-10",

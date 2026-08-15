@@ -27,7 +27,13 @@ from a207_policy import enforce_read, get_caller
 
 MCP_NAME = "CKDNutri-assessment-mcp"
 
-EgfrMethod = Literal["bedside2009", "revised2009", "classic"]
+# M-1（2026-08-15，第六轮审查）：revised2009 是**无文献出处的自造线性式**——
+# 0.413×Ht/(Scr+0.003×BUN−0.024)。Schwartz 2009 含 BUN 的修订式是 CKiD 组合式
+# （幂函数且**必需胱抑素 C**）：39.8×[Ht/Scr]^0.456×[1.8/CysC]^0.418×[30/BUN]^0.079
+# ×[1.076]male×[Ht/1.4]^0.179（2012 版；2009 原版 39.1×...^0.516×...^0.294×...^0.169
+# ×[1.099]male×...^0.188）。本系统无胱抑素 C 数据契约，无法实现真实 CKiD 式——
+# **移除假公式**：提供 BUN 时不再自动默认 revised2009，BUN 不参与计算（有告警）。
+EgfrMethod = Literal["bedside2009", "classic"]
 
 _BEDSIDE_K = 0.413  # Schwartz 2009 床旁系数
 # 肌酐单位换算单一事实源：µmol/L → mg/dL（P1 get_labs 输出 scr_umol_L 转 P4 公式所需单位）
@@ -156,9 +162,15 @@ def calc_egfr_schwartz(
     # 2026-08-12（系统性审查，P3）：sex 入口归一化一次，sex_note 复用归一化值
     # （_schwartz_k 内部保留 _normalize_sex 防御直接调用者，幂等无副作用）。
     sex = _normalize_sex(sex)
-    if method not in ("bedside2009", "revised2009", "classic"):
+    if method not in ("bedside2009", "classic"):
+        # M-1（2026-08-15）：revised2009 已移除（无文献出处的自造线性式）
+        if method == "revised2009":
+            raise ValueError(
+                "method='revised2009' 已移除：该线性式无文献出处。Schwartz 2009 含 BUN "
+                "修订为 CKiD 组合式（幂函数且必需胱抑素 C），本系统未实现；请使用 "
+                "bedside2009（BUN 不参与）或 classic")
         raise ValueError(
-            f"无效的 method: '{method}'，必须为 bedside2009 / revised2009 / classic 之一"
+            f"无效的 method: '{method}'，必须为 bedside2009 / classic 之一"
         )
     # BUG-58：显式拒绝 NaN/Inf 入参（NaN 身高/肌酐会算出 NaN eGFR，再被 classify_ckd 静默归 G5）
     # 2026-08-13（policy 审查，高优先级#5）：补**临床合理性上限**——此前仅做有限性与
@@ -185,12 +197,7 @@ def calc_egfr_schwartz(
         raise ValueError("serum_creatinine 必须 > 0")
     if scr < _MIN_SCR_MGDL:
         raise ValueError(f"serum_creatinine 低于物理合理下限（< {_MIN_SCR_MGDL} mg/dL）")
-    if method == "revised2009":
-        if bun_mg_dl is None:
-            raise ValueError("revised2009 需要 bun_mg_dl > 0")
-        bun_mg_dl = _require_finite(bun_mg_dl, "bun_mg_dl")
-        if bun_mg_dl <= 0:
-            raise ValueError("revised2009 需要 bun_mg_dl > 0")
+    # M-1（2026-08-15）：revised2009 前置校验随假公式一并移除（method 校验已在上方拒绝）
     # 2026-08-12（系统性审查，P1）：k_value 缺校验——k_value=0 会算出 eGFR=0 → classify
     # 误判 G5；负值产生负 eGFR。显式强校验（与 age/height/scr 同口径）。
     if k_value is not None:
@@ -206,23 +213,10 @@ def calc_egfr_schwartz(
         sex_note = ("；≥13y 女性 k=0.55" if (age_years >= 13 and k_value is None
                                             and sex == "female") else "")
         note = f"{k_note}；<1y=0.45, 1-12y=0.55, ≥13y 男0.70/女0.55，可被 k_value 覆盖。{sex_note}"
-        # 四审（2026-08-12）：提供了 BUN 但 method 非 revised2009——静默丢弃提示
-        # （与 k_value 在 revised2009 下的丢弃提示同类型，防审计无感知）。
+        # M-1（2026-08-15）：revised2009 已移除——含 BUN 修订需胱抑素 C（CKiD 组合式）
         if bun_mg_dl is not None:
-            note += "（提供了 BUN 但经典式未使用，如需 BUN 修订请用 method='revised2009'）"
-    elif method == "revised2009":
-        # bun_mg_dl 已由前置校验保证非空 > 0，此处不再重复判定
-        denom = scr + 0.003 * bun_mg_dl - 0.024
-        if denom <= 0:
-            raise ValueError("revised2009 分母非正（Scr+0.003×BUN-0.024 必须 > 0）")
-        egfr = _BEDSIDE_K * height_cm / denom
-        formula = f"eGFR = 0.413×height/(Scr + 0.003×BUN − 0.024)"
-        note = "含 BUN 修订 Schwartz 2009，对 eGFR<60 的儿童更准确。"
-        # 2026-08-13（二审 #1）：早产儿显式提示——revised2009 固定 k=0.413 无早产修正
-        # （相对 k=0.33 高估 ~25%），与床旁式同口径提示，不静默吞参（不做数值修正）。
-        if is_preterm and age_years < 1:
-            note += (" 注意：is_preterm=True 时 revised2009 仍用固定 k=0.413（无早产修正），"
-                     "相对早产 k=0.33 高估 eGFR 约 25%；如需 k=0.33 请用 method='classic'。")
+            note += ("（提供了 BUN 但经典式未使用；含 BUN 的修订需胱抑素 C（CKiD 组合式），"
+                     "本系统未实现，BUN 不参与计算）")
     else:  # bedside2009
         egfr = _BEDSIDE_K * height_cm / scr
         formula = "eGFR = 0.413×height/Scr"
@@ -233,9 +227,10 @@ def calc_egfr_schwartz(
         if is_preterm and age_years < 1:
             note += (" 注意：is_preterm=True 时床旁式仍用固定 k=0.413（无早产修正），"
                      "相对早产 k=0.33 高估 eGFR 约 25%；如需 k=0.33 请用 method='classic'。")
-        # 四审（2026-08-12）：提供了 BUN 但未用 revised2009——静默丢弃提示
+        # M-1（2026-08-15）：revised2009 已移除——含 BUN 修订需胱抑素 C（CKiD 组合式）
         if bun_mg_dl is not None:
-            note += "（提供了 BUN 但床旁式未使用，如需 BUN 修订请用 method='revised2009'）"
+            note += ("（提供了 BUN 但床旁式未使用；含 BUN 的修订需胱抑素 C（CKiD 组合式），"
+                     "本系统未实现，BUN 不参与计算）")
 
     # P4-3（2026-08-15）：eGFR 结果物理上限——入参有下限（scr≥0.05）但无结果上限，
     # 边界组合（如身高 250cm + scr 0.05）可算出 eGFR 数千被静默分期 G1。生理上
@@ -747,14 +742,14 @@ _LAB_ALIAS_TO_RULE: dict[str, tuple[str, float]] = {
     "na_mmol_L": ("na", 1.0),
     "ua_umol_L": ("ua", 1.0),
     "egfr_ml_min": ("egfr", 1.0),
-    # BUG-58（2026-08-12）：bun 短名口径与 eGFR revised2009 公式一致为 mg/dL——
+    # BUG-58（2026-08-12）：bun 短名口径与 mg/dL 一致（M-1 后 revised2009 已移除，保留换算防未来 bun 规则偏差）——
     # P1 的 bun_mmol_L（mmol/L 尿素氮）须 ×2.8 换算，原系数 1.0 会在未来新增 bun
     # 规则时产生 2.8 倍偏差（当前规则库尚无 bun 规则，属隐患修复）。
     "bun_mmol_L": ("bun", 2.8),
     # 2026-08-12（系统性审查，P1）：补 bun mg/dL 完整键名变体——P1 输入模型/别名表
     # 存在 bun_mg_dL（reference.py:219），编排层可能把该键直传 new_labs；此前无法映射
     # 为规则短名 "bun" → assess_clinical_status 的 `"bun" in norm_inputs` 补齐逻辑
-    # 失效 → method 自动推理看不到 BUN，静默降级 bedside2009（失去 revised2009 精算）。
+    # 失效 → method 自动推理看不到 BUN（M-1 后 BUN 本就不参与，仍保留映射供未来规则）。
     # 两变体（全小写 / P1 大写 L 风格）系数均为 1.0（mg/dL 与规则单位一致）。
     "bun_mg_dl": ("bun", 1.0),
     "bun_mg_dL": ("bun", 1.0),
@@ -1044,7 +1039,7 @@ def assess_clinical_status(
     """一键评估 CKD 临床状态（eGFR + 分期 + 风险评分 DAG）。
 
     身份来自部署注入的环境变量 A207_CALLER（P0-1）。
-    method=None 时自动推理（有 bun → revised2009，有 k_value → classic，
+    method=None 时自动推理（M-1 后：有 bun → 床旁式+告警，有 k_value → classic，
     <1y 早产儿 → classic[k=0.33]，否则 bedside2009）；传入 method 则优先使用传入值。
     sex（M/F/male/female/男/女）仅 method="classic" 且 ≥13y 时生效（女性 k=0.55）。
     serum_creatinine_unit（BUG-40 修复）：mg_dL 默认 / umol_L 自动 ÷88.4——P1 get_labs
@@ -1094,15 +1089,19 @@ def assess_clinical_status(
     # 自动识别 Schwartz 方法（显式传入优先）
     warnings: List[str] = []
     if method is None:
+        # M-1（2026-08-15）：提供 BUN 不再自动默认 revised2009（假公式已移除）——
+        # 含 BUN 修订需胱抑素 C（CKiD 组合式）本系统未实现，BUN 不参与计算，降级床旁式
+        # 并显式告警（不静默吞参）。
         if bun_mg_dl is not None:
-            method = "revised2009"
-            # 2026-08-12（系统性审查）：bun 与 k_value 同时给出且未显式 method 时，
-            # revised2009 用固定系数 0.413、k_value 被静默丢弃——显式标注，不悄悄吞参。
+            method = "bedside2009"
+            warnings.append(
+                "提供了 bun_mg_dl 但未指定 method：含 BUN 的修订需胱抑素 C（CKiD "
+                "组合式），本系统未实现，BUN 不参与计算；已按床旁式（0.413）处理。"
+                "如需自定义 k 值请显式 method='classic' 并传 k_value。")
             if k_value is not None:
                 warnings.append(
-                    "同时提供 bun_mg_dl 与 k_value 且未指定 method：按 revised2009"
-                    "（固定系数 0.413）计算，k_value 被忽略；如需自定义 k 值请显式"
-                    "method='classic' 并传 k_value。")
+                    "同时提供 bun_mg_dl 与 k_value 且未指定 method：k_value 被忽略；"
+                    "如需自定义 k 值请显式 method='classic' 并传 k_value。")
         elif k_value is not None:
             method = "classic"
         elif is_preterm and age_years < 1:

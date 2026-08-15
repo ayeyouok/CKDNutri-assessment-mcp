@@ -65,13 +65,28 @@ def test_egfr_golden_classic_preterm():
 
 
 def test_egfr_golden_revised_bun():
-    """修订 Schwartz 2009：eGFR = 0.413×H/(Scr + 0.003×BUN − 0.024)。"""
+    """M-1（2026-08-15）：revised2009 假公式已移除——该线性式（0.413×H/(Scr+0.003×BUN−0.024)）
+    无文献出处；Schwartz 2009 含 BUN 修订为 CKiD 组合式（幂函数且必需胱抑素 C），本系统未实现。
+    断言：① 显式 method='revised2009' 拒绝；② 提供 BUN 未指定 method → 降级床旁式 + 告警。"""
     from CKDNutri_assessment_mcp import core
 
-    r = core.calc_egfr_schwartz(age_years=6, height_cm=115, serum_creatinine_mgdl=0.6,
+    # ① 假公式拒绝（fail-closed，不再静默算错值）
+    try:
+        core.calc_egfr_schwartz(age_years=6, height_cm=115, serum_creatinine_mgdl=0.6,
                                 bun_mg_dl=30, method="revised2009")
-    expect = 0.413 * 115 / (0.6 + 0.003 * 30 - 0.024)
-    _near(r["data"]["egfr"], expect)
+    except ValueError as exc:
+        assert "revised2009" in str(exc) and "胱抑素" in str(exc), exc
+    else:
+        raise AssertionError("revised2009 应被拒绝（假公式已移除）")
+
+    # ② BUN 自动推理：降级床旁式 + 显式告警（BUN 不参与计算）
+    r = core.calc_egfr_schwartz(age_years=6, height_cm=115, serum_creatinine_mgdl=0.6,
+                                bun_mg_dl=30)
+    assert r["ok"] is True, r
+    assert r["data"]["method"] == "bedside2009", r["data"]["method"]
+    expect = 0.413 * 115 / 0.6
+    _near(r["data"]["egfr"], expect, tol=0.01)
+    assert "胱抑素" in (r["data"].get("note") or ""), r["data"].get("note")
 
 
 def test_egfr_golden_boundaries():
