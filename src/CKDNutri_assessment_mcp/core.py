@@ -63,8 +63,20 @@ def _egfr_to_g(egfr: float, dialysis_mode: Optional[str] = None) -> str:
         return "G3b"
     if egfr >= 15:
         return "G4"
-    if dialysis_mode and dialysis_mode.strip().lower() != "none":
-        return "G5D"
+    # P4-3（2026-08-15）：dialysis_mode 白名单校验——此前任意非空非 "none" 字符串
+    # （"yes"/"NoNe "/"0" 等录入错误）都被判 G5D（fail-open）。server 层已有
+    # Literal 枚举拦截，但 core 是纯函数可被编排层直调（绕过 server），补同口径
+    # 白名单：仅显式透析模式才判 G5D，其余拒绝（录入错误不应静默升为透析分期）。
+    if dialysis_mode:
+        dm = dialysis_mode.strip().lower()
+        if dm == "none":
+            pass
+        elif dm in ("hemodialysis", "peritoneal"):
+            return "G5D"
+        else:
+            raise ValueError(
+                f"dialysis_mode 必须是 none / hemodialysis / peritoneal 之一，收到："
+                f"{dialysis_mode!r}")
     return "G5"
 
 
@@ -157,7 +169,12 @@ def calc_egfr_schwartz(
     if age_years < 0:
         raise ValueError("age_years 不能为负")
     if age_years > _MAX_AGE_YEARS:
-        raise ValueError(f"age_years 超出儿童 CKD 适用域（> {_MAX_AGE_YEARS:.0f} 岁）")
+        # P4-1（2026-08-15）：硬拒绝（儿童系数用于成人会系统性偏估，fail-closed）+
+        # 错误信息直接指引成人公式——此前"提示改用 CKD-EPI"写在返回值 caveat 里，
+        # 但 >18 已被此处拒绝、caveat 不可达（死代码），提示从未到达用户。
+        raise ValueError(
+            f"age_years 超出儿童 CKD 适用域（> {_MAX_AGE_YEARS:.0f} 岁）：本系统仅覆盖"
+            "儿童 CKD（Schwartz 公式），成人请改用 CKD-EPI 公式评估")
     if height_cm <= 0:
         raise ValueError("height_cm 必须 > 0")
     if height_cm > _MAX_HEIGHT_CM:
@@ -220,6 +237,13 @@ def calc_egfr_schwartz(
         if bun_mg_dl is not None:
             note += "（提供了 BUN 但床旁式未使用，如需 BUN 修订请用 method='revised2009'）"
 
+    # P4-3（2026-08-15）：eGFR 结果物理上限——入参有下限（scr≥0.05）但无结果上限，
+    # 边界组合（如身高 250cm + scr 0.05）可算出 eGFR 数千被静默分期 G1。生理上
+    # 儿童 eGFR 罕见 >200（正常 90-140），超限必为录入错误，拒绝（fail-closed）。
+    if egfr > 200:
+        raise ValueError(
+            f"eGFR 计算结果 {egfr:.1f} ml/min/1.73m² 超出儿童生理合理上限（>200），"
+            "通常是身高/肌酐录入错误或单位错配，请核查数据")
     egfr_rounded = round(egfr, 1)
     # N1 修复（2026-08-13）：**未 round 值判级、round 值展示**——此前 round(egfr,1)
     # 先于分期，89.96→90.0 会在边界翻 G2→G1（DAG 用同一舍入值喂 R-07 同理）。
@@ -231,12 +255,10 @@ def calc_egfr_schwartz(
         "G1/G2 阈值在婴儿期需结合月龄与生长曲线解读。"
         if age_years < 2 else ""
     )
-    # 四审（2026-08-12）：>18 岁超出儿童 Schwartz 公式适用域——显式提示改用成人
-    # CKD-EPI 公式（此前静默计算，儿童系数用于成人会系统性偏估）。
-    adult_caveat = (
-        "注意：年龄 >18 岁超出儿童 Schwartz 公式适用域，建议改用成人 CKD-EPI 公式评估。"
-        if age_years > 18 else ""
-    )
+    # P4-1（2026-08-15）：adult_caveat 恒为空——>18 岁已在入参校验硬拒绝
+    # （错误信息含"成人请改用 CKD-EPI"指引），旧版"age>18 提示改用 CKD-EPI"
+    # 分支在此处不可达（死代码）。字段保留以维持返回契约（客户端兼容），值恒 ""。
+    adult_caveat = ""
     # BUG-15：成功返回统一 {ok, data} 信封（此前扁平结构）；BUG-34：含 caller 审计字段
     return {
         "ok": True,

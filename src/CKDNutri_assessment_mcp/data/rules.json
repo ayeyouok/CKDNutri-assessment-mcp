@@ -1,125 +1,158 @@
 {
-  "meta": {
-    "note": "M8 内置规则库。单位遵循 PCP 契约标准单位：scr=mg/dL, k=mmol/L, p=mmol/L, hb=g/L, ca=mmol/L, ua=umol/L, egfr=ml/min/1.73m^2。四审（2026-08-12）：引擎入口已做键名+单位归一化（BUG-45：P1 完整键名如 scr_umol_L/k_mmol_L 自动映射到规则短名并换算单位，scr_umol_L ÷88.4、bun_mmol_L ×2.8），调用方可直接透传 P1 get_labs 返回值；规则库内部一律用短名+规范单位。",
-    "level_correction": "新数据驱动重评；prior_level 仅作对比，缺失新数据时绝不兜底输出历史等级。"
+ "meta": {
+  "note": "M8 内置规则库。单位遵循 PCP 契约标准单位：scr=mg/dL, k=mmol/L, p=mmol/L, hb=g/L, ca=mmol/L, ua=umol/L, egfr=ml/min/1.73m^2。四审（2026-08-12）：引擎入口已做键名+单位归一化（BUG-45：P1 完整键名如 scr_umol_L/k_mmol_L 自动映射到规则短名并换算单位，scr_umol_L ÷88.4、bun_mmol_L ×2.8），调用方可直接透传 P1 get_labs 返回值；规则库内部一律用短名+规范单位。",
+  "level_correction": "新数据驱动重评；prior_level 仅作对比，缺失新数据时绝不兜底输出历史等级。"
+ },
+ "level_meaning": {
+  "L1": "危急：需立即处置并触发通知（经 M10）",
+  "L2": "高危：24-48h 内处置",
+  "L3": "低风险：常规随访关注"
+ },
+ "rules": [
+  {
+   "id": "R-01",
+   "name": "血肌酐急性上升",
+   "level": "L1",
+   "type": "trend_pct",
+   "metric": "scr",
+   "direction": "up",
+   "threshold_pct": 50,
+   "unit": "%",
+   "description": "血肌酐较上次升高 >=50%，提示急性肾损伤（AKI）风险"
   },
-  "level_meaning": {
-    "L1": "危急：需立即处置并触发通知（经 M10）",
-    "L2": "高危：24-48h 内处置",
-    "L3": "低风险：常规随访关注"
+  {
+   "id": "R-08",
+   "name": "血肌酐升高",
+   "level": "L3",
+   "type": "trend_pct",
+   "metric": "scr",
+   "direction": "up",
+   "low_pct": 30,
+   "high_pct": 50,
+   "unit": "%",
+   "description": "血肌酐较上次升高 30%-50%（不含 50%）"
   },
-  "rules": [
-    {
-      "id": "R-01",
-      "name": "血肌酐急性上升",
-      "level": "L1",
-      "type": "trend_pct",
-      "metric": "scr",
-      "direction": "up",
-      "threshold_pct": 50,
-      "unit": "%",
-      "description": "血肌酐较上次升高 >=50%，提示急性肾损伤（AKI）风险"
-    },
-    {
-      "id": "R-08",
-      "name": "血肌酐升高",
-      "level": "L3",
-      "type": "trend_pct",
-      "metric": "scr",
-      "direction": "up",
-      "low_pct": 30,
-      "high_pct": 50,
-      "unit": "%",
-      "description": "血肌酐较上次升高 30%-50%（不含 50%）"
-    },
-    {
-      "id": "R-02",
-      "name": "高钾血症",
-      "level": "L1",
-      "type": "absolute",
-      "metric": "k",
-      "operator": "gte",
-      "threshold": 5.5,
-      "unit": "mmol/L",
-      "description": "血钾 >= 5.5 mmol/L（含 5.5，KDIGO 降钾阈值；与 R-10 上界衔接，消除 5.5 边界空隙）"
-    },
-    {
-      "id": "R-10",
-      "name": "血钾偏高",
-      "level": "L3",
-      "type": "absolute",
-      "metric": "k",
-      "operator": "between",
-      "low": 5.0,
-      "high": 5.5,
-      "unit": "mmol/L",
-      "description": "血钾 5.0-5.5 mmol/L（不含上界）"
-    },
-    {
-      "id": "R-03",
-      "name": "危急高钾血症",
-      "level": "L1",
-      "type": "absolute",
-      "metric": "k",
-      "operator": "gt",
-      "threshold": 6.5,
-      "unit": "mmol/L",
-      "description": "血钾 > 6.5 mmol/L 危急，绕过营养流程直连 M10 通知"
-    },
-    {
-      "id": "R-04",
-      "name": "重度贫血",
-      "level": "L1",
-      "type": "absolute",
-      "metric": "hb",
-      "operator": "lt",
-      "threshold": 60,
-      "unit": "g/L",
-      "description": "血红蛋白 < 60 g/L 危急"
-    },
-    {
-      "id": "R-05",
-      "name": "低钙血症",
-      "level": "L1",
-      "type": "absolute",
-      "metric": "ca",
-      "operator": "lt",
-      "threshold": 1.6,
-      "unit": "mmol/L",
-      "description": "血钙 < 1.6 mmol/L 危急"
-    },
-    {
-      "id": "R-06",
-      "name": "高磷血症",
-      "level": "L2",
-      "type": "absolute",
-      "metric": "p",
-      "operator": "gt",
-      "threshold": 2.1,
-      "unit": "mmol/L",
-      "description": "血磷 > 2.1 mmol/L"
-    },
-    {
-      "id": "R-07",
-      "name": "eGFR 下降",
-      "level": "L2",
-      "type": "trend_pct",
-      "metric": "egfr",
-      "direction": "down",
-      "threshold_pct": 25,
-      "unit": "%",
-      "description": "eGFR 较前下降 >=25%，提示分期恶化"
-    },
-    {
-      "id": "R-09",
-      "name": "高尿酸血症",
-      "level": "L3",
-      "type": "absolute",
-      "metric": "ua",
-      "operator": "gt",
-      "threshold": 480,
-      "unit": "umol/L",
-      "description": "血尿酸 > 480 umol/L"
-    }
-  ]
+  {
+   "id": "R-02",
+   "name": "高钾血症",
+   "level": "L1",
+   "type": "absolute",
+   "metric": "k",
+   "operator": "gte",
+   "threshold": 5.5,
+   "unit": "mmol/L",
+   "description": "血钾 >= 5.5 mmol/L（含 5.5，KDIGO 降钾阈值；与 R-10 上界衔接，消除 5.5 边界空隙）"
+  },
+  {
+   "id": "R-10",
+   "name": "血钾偏高",
+   "level": "L3",
+   "type": "absolute",
+   "metric": "k",
+   "operator": "between",
+   "low": 5.0,
+   "high": 5.5,
+   "unit": "mmol/L",
+   "description": "血钾 5.0-5.5 mmol/L（不含上界）"
+  },
+  {
+   "id": "R-03",
+   "name": "危急高钾血症",
+   "level": "L1",
+   "type": "absolute",
+   "metric": "k",
+   "operator": "gt",
+   "threshold": 6.5,
+   "unit": "mmol/L",
+   "description": "血钾 > 6.5 mmol/L 危急，绕过营养流程直连 M10 通知"
+  },
+  {
+   "id": "R-04",
+   "name": "重度贫血",
+   "level": "L1",
+   "type": "absolute",
+   "metric": "hb",
+   "operator": "lt",
+   "threshold": 60,
+   "unit": "g/L",
+   "description": "血红蛋白 < 60 g/L 危急"
+  },
+  {
+   "id": "R-05",
+   "name": "低钙血症",
+   "level": "L1",
+   "type": "absolute",
+   "metric": "ca",
+   "operator": "lt",
+   "threshold": 1.6,
+   "unit": "mmol/L",
+   "description": "血钙 < 1.6 mmol/L 危急"
+  },
+  {
+   "id": "R-06",
+   "name": "高磷血症",
+   "level": "L2",
+   "type": "absolute",
+   "metric": "p",
+   "operator": "gt",
+   "threshold": 2.1,
+   "unit": "mmol/L",
+   "description": "血磷 > 2.1 mmol/L"
+  },
+  {
+   "id": "R-07",
+   "name": "eGFR 下降",
+   "level": "L2",
+   "type": "trend_pct",
+   "metric": "egfr",
+   "direction": "down",
+   "threshold_pct": 25,
+   "unit": "%",
+   "description": "eGFR 较前下降 >=25%，提示分期恶化"
+  },
+  {
+   "id": "R-09",
+   "name": "高尿酸血症",
+   "level": "L3",
+   "type": "absolute",
+   "metric": "ua",
+   "operator": "gt",
+   "threshold": 480,
+   "unit": "umol/L",
+   "description": "血尿酸 > 480 umol/L"
+  },
+  {
+   "id": "R-11",
+   "name": "危急低钾血症",
+   "level": "L1",
+   "type": "absolute",
+   "metric": "k",
+   "operator": "lt",
+   "threshold": 2.8,
+   "unit": "mmol/L",
+   "description": "血钾 < 2.8 mmol/L 危急（与 P1 CRITICAL_RULES CRIT-K-LOW 同阈值），重度低钾可致心律失常，直连 M10 通知"
+  },
+  {
+   "id": "R-12",
+   "name": "低钠血症",
+   "level": "L1",
+   "type": "absolute",
+   "metric": "na",
+   "operator": "lt",
+   "threshold": 120.0,
+   "unit": "mmol/L",
+   "description": "血钠 < 120 mmol/L 危急（与 P1 CRITICAL_RULES CRIT-NA-LOW 同阈值），重度低钠有脑水肿风险——此前 rules.json 无钠规则（na 别名映射存在但永不触发）"
+  },
+  {
+   "id": "R-13",
+   "name": "高钠血症",
+   "level": "L1",
+   "type": "absolute",
+   "metric": "na",
+   "operator": "gt",
+   "threshold": 160.0,
+   "unit": "mmol/L",
+   "description": "血钠 > 160 mmol/L 危急（与 P1 CRITICAL_RULES CRIT-NA-HIGH 同阈值），重度高钠提示脱水/钠负荷过重"
+  }
+ ]
 }
