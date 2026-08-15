@@ -513,7 +513,11 @@ def _validate_rules_schema(rules_doc: Dict[str, Any]) -> None:
     """
     rules = rules_doc.get("rules")
     if not isinstance(rules, list) or not rules:
-        raise ValueError("风险规则库缺少非空 'rules' 列表，拒绝加载")
+        # #8（2026-08-15）：规则库损坏是**服务端数据问题**，抛 RuntimeError 归
+        # INTERNAL_ERROR（detail 脱敏）——此前抛 ValueError 被 translate_error
+        # 归 INVALID_INPUT（客户端错误码）+ detail 泄露规则全文，与 P5 数据错误
+        # 处理方向相反（服务端数据损坏 ≠ 客户端入参错误）。
+        raise RuntimeError("风险规则库缺少非空 'rules' 列表，拒绝加载（服务端数据损坏）")
     # P1-6 修复（2026-08-13）：metric 值域校验——合法短名 = _LAB_ALIAS_TO_RULE 的
     # short 集合（scr/k/p/hb/ca/na/ua/egfr/bun/uacr/upcr）。此前拼错的 metric（如
     # "ks"）静默跳过该规则 → overall_level="none" 给临床"无风险"假象（fail-open）。
@@ -521,37 +525,37 @@ def _validate_rules_schema(rules_doc: Dict[str, Any]) -> None:
                                     ((k, v) for k, v in _LAB_ALIAS_TO_RULE.items()))
     for r in rules:
         if not isinstance(r, dict):
-            raise ValueError(f"规则条目 {r!r} 非字典，拒绝加载")
+            raise RuntimeError(f"规则条目 {r!r} 非字典，拒绝加载")
         missing = [k for k in _RULE_REQUIRED_KEYS if not str(r.get(k) or "").strip()]
         if missing:
-            raise ValueError(
+            raise RuntimeError(
                 f"规则 {r.get('id', '?')} 缺少必填键 {missing}，拒绝加载（fail-closed）")
         if r["level"] not in _VALID_RULE_LEVELS:
-            raise ValueError(
+            raise RuntimeError(
                 f"规则 {r['id']} level={r['level']!r} 非法，必须是 {sorted(_VALID_RULE_LEVELS)}")
         # P1-6：metric 必须落在合法短名集合内（fail-closed，防静默跳过规则）
         if r.get("metric") not in _VALID_RULE_METRICS:
-            raise ValueError(
+            raise RuntimeError(
                 f"规则 {r['id']} metric={r.get('metric')!r} 非法，必须是 "
                 f"{sorted(_VALID_RULE_METRICS)}（P1-6：拼错 metric 会静默漏报）")
         if r["type"] == "absolute":
             op = r.get("operator")
             if op not in _VALID_ABS_OPS:
-                raise ValueError(
+                raise RuntimeError(
                     f"规则 {r['id']} operator={op!r} 非法，必须是 {sorted(_VALID_ABS_OPS)}")
             if op == "between":
                 low, high = r.get("low"), r.get("high")
                 if not (isinstance(low, (int, float)) and isinstance(high, (int, float))
                         and low < high):
-                    raise ValueError(
+                    raise RuntimeError(
                         f"规则 {r['id']} between 需 low < high 数值，收到 low={low!r} high={high!r}")
             elif not isinstance(r.get("threshold"), (int, float)):
-                raise ValueError(
+                raise RuntimeError(
                     f"规则 {r['id']} 单边 operator 需数值 threshold，收到 {r.get('threshold')!r}")
         elif r["type"] == "trend_pct":
             direction = r.get("direction")
             if direction not in _VALID_TREND_DIRECTIONS:
-                raise ValueError(
+                raise RuntimeError(
                     f"规则 {r['id']} direction={direction!r} 非法，必须是 up / down")
             # 2026-08-13（二审 #3）：单阈值（threshold_pct）与区间（low_pct/high_pct）
             # **二选一互斥**——此前 R-08 曾同时携带 threshold_pct:30 与 low/high:30/50
@@ -559,21 +563,21 @@ def _validate_rules_schema(rules_doc: Dict[str, Any]) -> None:
             has_single = "threshold_pct" in r
             has_range = "low_pct" in r or "high_pct" in r
             if has_single and has_range:
-                raise ValueError(
+                raise RuntimeError(
                     f"规则 {r['id']} threshold_pct 与 low_pct/high_pct 必须二选一（互斥），"
                     f"当前同时提供")
             if has_range:
                 low_pct, high_pct = r.get("low_pct"), r.get("high_pct")
                 if not (isinstance(low_pct, (int, float)) and isinstance(high_pct, (int, float))
                         and low_pct < high_pct):
-                    raise ValueError(
+                    raise RuntimeError(
                         f"规则 {r['id']} 区间型趋势需 low_pct < high_pct，收到 "
                         f"low_pct={low_pct!r} high_pct={high_pct!r}")
             elif not isinstance(r.get("threshold_pct"), (int, float)):
-                raise ValueError(
+                raise RuntimeError(
                     f"规则 {r['id']} 单阈值趋势需数值 threshold_pct，收到 {r.get('threshold_pct')!r}")
         else:
-            raise ValueError(
+            raise RuntimeError(
                 f"规则 {r['id']} type={r['type']!r} 非法，必须是 absolute / trend_pct")
 
 

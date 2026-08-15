@@ -62,11 +62,14 @@ def test_rules_schema_validation():
     from CKDNutri_assessment_mcp import core
 
     def _rejects(rules_doc, label):
+        # #8（2026-08-15）：规则库损坏是**服务端数据问题**，抛 RuntimeError（归
+        # INTERNAL_ERROR + 脱敏）；客户端入参错误才抛 ValueError——测试同时接受
+        # 两者（数据损坏语义已迁移）。
         try:
             core._validate_rules_schema(rules_doc)
-        except ValueError:
+        except (ValueError, RuntimeError):
             return
-        raise AssertionError(f"期望 {label} 抛 ValueError")
+        raise AssertionError(f"期望 {label} 抛异常")
 
     _rejects({"rules": []}, "空 rules")
     _rejects({"rules": [{"id": "X"}]}, "缺必填键")
