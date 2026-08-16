@@ -59,6 +59,7 @@ def assess_clinical_status_tool(
     sex: Optional[Literal["M", "F"]] = None,
     uacr_mg_g: Optional[float] = None,
     upcr_mg_g: Optional[float] = None,
+    upcr_mg_mmol: Optional[float] = None,  # M-5（2026-08-16）：UPCR mg/mmol（P1 契约单位），自动 ÷8.84
     bun_mg_dl: Optional[float] = None,
     k_value: Optional[float] = None,
     method: Optional[Literal["bedside2009", "classic"]] = None,  # M-1：revised2009 假公式已移除（CKiD 组合式需胱抑素 C，未实现）
@@ -78,6 +79,10 @@ def assess_clinical_status_tool(
     sex（M/F，可选）：经典 Schwartz ≥13y 青少年女性 k=0.55（男性 0.70），
     仅 method="classic" 时生效；不传或 method 非 classic 时不影响计算。
     is_preterm：<1y 早产儿在 method 未指定时自动采用经典式 k=0.33（防 eGFR 高估）。
+
+    UPCR 单位（M-5，2026-08-16）：upcr_mg_g（mg/g，KDIGO 阈值单位）与
+    upcr_mg_mmol（mg/mmol，P1 契约单位，自动 ÷8.84 换算）**二选一**——两者同时
+    传入即拒绝（差 8.84 倍，防单位歧义导致分期错误）。UACR 同单位 mg/g。
 
     new_labs（本轮新化验，可选）支持两种键名（**务必使用以下标准 Key，勿自定义
     如 creatinine/potassium 等名称**）：
@@ -104,6 +109,7 @@ def assess_clinical_status_tool(
             is_preterm=is_preterm,
             sex=sex,
             uacr_mg_g=uacr_mg_g, upcr_mg_g=upcr_mg_g,
+            upcr_mg_mmol=upcr_mg_mmol,  # M-5 透传
             bun_mg_dl=bun_mg_dl, k_value=k_value,
             method=method,
             new_labs=new_labs, prior_labs=prior_labs, prior_level=prior_level,

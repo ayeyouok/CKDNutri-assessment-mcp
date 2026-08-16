@@ -338,6 +338,7 @@ def classify_ckd(
     uacr_mg_g: Optional[float] = None,
     upcr_mg_g: Optional[float] = None,
     dialysis_mode: Optional[str] = None,
+    upcr_mg_mmol: Optional[float] = None,
 ) -> dict:
     """KDIGO 2024 儿童 CKD 合并分期。
 
@@ -347,6 +348,15 @@ def classify_ckd(
     S1 修复（2026-08-13）：新增 dialysis_mode 可选入参——透析患儿 eGFR<15 分期为
     G5D（KDIGO 2024 / PRNT 2025），与 G5 区分（随访频率不同：G5D 每月 vs G5 每 60 天）。
     合法值：none / hemodialysis / peritoneal（透传 classify 后的 G5D 供 care 层消费）。
+
+    M-5（2026-08-16，十一审）：**UPCR 单位防呆**——P1 契约 upcr_mg_mmol（mg/mmol）
+    与 KDIGO UPCR 阈值单位（mg/g）差 **8.84 倍**，此前仅收 upcr_mg_g，编排层误传
+    P1 值即静默错 8.84 倍。现支持 upcr_mg_mmol（自动 ÷8.84 换算为 mg/g 后参与）：
+    - 仅传 upcr_mg_g：按原口径（KDIGO mg/g）；
+    - 仅传 upcr_mg_mmol：÷8.84 换算并标注来源；
+    - **同时传两单位：拒绝**（单位歧义，防静默错 8.84 倍）。
+    换算系数 8.84（肌酐 mmol→mg 摩尔质量 113.12 mg/mmol ÷ 1000 × ... 即
+    1 mg/mmol = 8.84 mg/g，见 clinical-data reference.UNIT_ALIASES 同口径）。
 
     BUG-34：显式取 caller 并回写审计字段。
     """
@@ -358,29 +368,40 @@ def classify_ckd(
         raise ValueError("egfr 必须 >= 0")
     if dialysis_mode is not None and not isinstance(dialysis_mode, str):
         raise ValueError("dialysis_mode 必须为字符串（none/hemodialysis/peritoneal）")
-    if uacr_mg_g is not None:
-        uacr_mg_g = _require_finite(uacr_mg_g, "uacr_mg_g")
-        if uacr_mg_g < 0:
-            raise ValueError("uacr_mg_g 不能为负")
+    # M-5：UPCR 双单位同时传入 → 单位歧义拒绝（防编排层传错静默 8.84 倍）
+    if upcr_mg_g is not None and upcr_mg_mmol is not None:
+        raise ValueError(
+            "UPCR 同时提供了 mg/g 与 mg/mmol 两种单位（差 8.84 倍）——请只传一种，"
+            "避免单位歧义导致分期错误")
     if upcr_mg_g is not None:
         upcr_mg_g = _require_finite(upcr_mg_g, "upcr_mg_g")
         if upcr_mg_g < 0:
             raise ValueError("upcr_mg_g 不能为负")
+    if upcr_mg_mmol is not None:
+        upcr_mg_mmol = _require_finite(upcr_mg_mmol, "upcr_mg_mmol")
+        if upcr_mg_mmol < 0:
+            raise ValueError("upcr_mg_mmol 不能为负")
+    if uacr_mg_g is not None:
+        uacr_mg_g = _require_finite(uacr_mg_g, "uacr_mg_g")
+        if uacr_mg_g < 0:
+            raise ValueError("uacr_mg_g 不能为负")
 
     g = _egfr_to_g(egfr, dialysis_mode)
     a: Optional[str] = None
     albuminuria_source = ""
     albuminuria_note = None
+    upcr_used = upcr_mg_g if upcr_mg_g is not None else (
+        (upcr_mg_mmol / 8.84) if upcr_mg_mmol is not None else None)
     if uacr_mg_g is not None:
         a = _acr_to_a(uacr_mg_g)
         albuminuria_source = "UACR"
-        if upcr_mg_g is not None:
+        if upcr_used is not None:
             # 2026-08-12（系统性审查，P3）：双指标同时传入时透明化——KDIGO 2024 以
             # UACR 为准，但 UPCR 的忽略状态须显式标注供上游审计（此前静默丢弃，
             # 审计无法知晓 UPCR 已提供却未参与分期）。
             albuminuria_note = ("同时提供 UACR 与 UPCR：按 KDIGO 2024 以 UACR 为准，"
                                 "UPCR 未用于 A 分期。")
-    elif upcr_mg_g is not None:
+    elif upcr_used is not None:
         # BUG-48（2026-08-12）：KDIGO 2024 白蛋白尿 A 分期**仅基于 UACR**。UPCR 反映尿总蛋白
         # （含球蛋白），与白蛋白不等价——肾病综合征等患儿 UPCR 显著高于 UACR，直接映射
         # 会把 A1 误判为 A2/A3。故仅提供 UPCR 时**不再映射 A 分期**（a=None），
@@ -1038,6 +1059,7 @@ def assess_clinical_status(
     prior_labs: Optional[Dict[str, float]] = None,
     prior_level: Optional[str] = None,
     dialysis_mode: Optional[str] = None,
+    upcr_mg_mmol: Optional[float] = None,
 ) -> Dict[str, Any]:
     """一键评估 CKD 临床状态（eGFR + 分期 + 风险评分 DAG）。
 
@@ -1155,6 +1177,7 @@ def assess_clinical_status(
         uacr_mg_g=uacr_mg_g,
         upcr_mg_g=upcr_mg_g,
         dialysis_mode=dialysis_mode,
+        upcr_mg_mmol=upcr_mg_mmol,  # M-5（2026-08-16）：UPCR mg/mmol 入参透传
     )
     # 始终以本轮计算的 eGFR + 已传入参数打底做风险评估，不因未传 new_labs 而静默跳过
     # 2026-08-12（系统性审查，P3）：labs 直接基于**已归一化**的 norm_inputs 构造——
