@@ -235,9 +235,12 @@ def calc_egfr_schwartz(
     # P4-3（2026-08-15）：eGFR 结果物理上限——入参有下限（scr≥0.05）但无结果上限，
     # 边界组合（如身高 250cm + scr 0.05）可算出 eGFR 数千被静默分期 G1。生理上
     # 儿童 eGFR 罕见 >200（正常 90-140），超限必为录入错误，拒绝（fail-closed）。
-    if egfr > 200:
+    # F1（2026-08-16，第七轮审查）：eGFR 上限 200→250——200 会误拒正常变异（矮小+
+    # 低肌酐儿童如 3 岁 100cm + scr 0.2 → eGFR≈206，健康儿童高值可达 200+）；250
+    # 以上才是必然的录入错误/单位错配（儿童生理上限 ~230）。
+    if egfr > 250:
         raise ValueError(
-            f"eGFR 计算结果 {egfr:.1f} ml/min/1.73m² 超出儿童生理合理上限（>200），"
+            f"eGFR 计算结果 {egfr:.1f} ml/min/1.73m² 超出儿童生理合理上限（>250），"
             "通常是身高/肌酐录入错误或单位错配，请核查数据")
     egfr_rounded = round(egfr, 1)
     # N1 修复（2026-08-13）：**未 round 值判级、round 值展示**——此前 round(egfr,1)
@@ -1053,6 +1056,15 @@ def assess_clinical_status(
     """
     caller = get_caller()  # BUG-34：显式取 caller 回写审计字段
     enforce_read(MCP_NAME)
+    # F5（2026-08-16，第七轮审查）：DAG 入口 dialysis_mode 白名单（防御纵深）——
+    # 正常路径经 classify_ckd → _egfr_to_g 叶子校验，但 DAG 重构绕过叶子即漏；
+    # 入口同口径显式拒绝非法值（与 _egfr_to_g 一致）。
+    if dialysis_mode is not None:
+        if not isinstance(dialysis_mode, str) \
+                or dialysis_mode.strip().lower() not in ("none", "hemodialysis", "peritoneal"):
+            raise ValueError(
+                f"dialysis_mode 必须是 none / hemodialysis / peritoneal 之一，收到："
+                f"{dialysis_mode!r}")
 
     # 2026-08-12（系统性审查，P1）：sex 入口统一清洗为 "male"/"female"/None——
     # 与 calc 内部归一化幂等，保证全链路口径一致（审计/日志/sex_note 单一事实源）。

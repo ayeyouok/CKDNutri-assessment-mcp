@@ -73,8 +73,50 @@ def test_a_b5_short_key_case_insensitive():
     assert r["data"]["overall_level"] == "L1", r["data"]["overall_level"]
 
 
+def test_a_b6_classify_ckd_albuminuria():
+    """F8（2026-08-16，第七轮审查）：classify_ckd 白蛋白尿 A 分期此前零测试
+    （临床关键路径：A 分期决定随访频率）。KDIGO 2024：A1<30 / A2 30-300 / A3>300 mg/g。"""
+    from CKDNutri_assessment_mcp import core
+
+    def _a(uacr):
+        r = core.classify_ckd(egfr=45.0, uacr_mg_g=uacr)
+        assert r["ok"] is True, r
+        return r["data"]["a"]
+
+    assert _a(10) == "A1", _a(10)
+    assert _a(30) == "A2", _a(30)    # KDIGO A2 = 30-300（含 300）
+    assert _a(150) == "A2", _a(150)
+    assert _a(300) == "A2", _a(300)
+    assert _a(800) == "A3", _a(800)
+    # UPCR 路径：KDIGO 2024 白蛋白尿 A 分期仅基于 UACR——UPCR 含球蛋白排泄与
+    # 白蛋白不等价，设计上不映射 A 分期（a=None + 提示补充 UACR），断言该契约。
+    r = core.classify_ckd(egfr=45.0, upcr_mg_g=500.0)
+    assert r["data"]["a"] is None, r["data"]
+    assert "UACR" in r["data"]["albuminuria_note"], r["data"]["albuminuria_note"]
+    # 组合分期 GxAx
+    r = core.classify_ckd(egfr=45.0, uacr_mg_g=150.0)
+    assert r["data"]["stage"] == "G3aA2", r["data"]["stage"]
+
+def test_a_b7_egfr_upper_bound_relaxed():
+    """F1（2026-08-16，第七轮审查）：eGFR 上限 200→250——矮小+低肌酐正常变异
+    （3 岁 100cm + scr 0.2 → eGFR≈206）不再被误拒；250 以上仍拒绝（录入错误）。"""
+    from CKDNutri_assessment_mcp import core
+
+    r = core.calc_egfr_schwartz(age_years=3, height_cm=100, serum_creatinine_mgdl=0.2)
+    assert r["ok"] is True and r["data"]["egfr"] > 200, r
+    try:
+        core.calc_egfr_schwartz(age_years=10, height_cm=250, serum_creatinine_mgdl=0.05)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("eGFR>250 应拒绝（录入错误）")
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
         fn()
     print(f"P4 A-S1/A-B1/A-B2/A-B5 REGRESSION OK（{len(fns)} 个用例）")
+
+
+
+
