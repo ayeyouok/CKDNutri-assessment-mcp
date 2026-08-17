@@ -177,25 +177,33 @@ def test_plausibility_range_and_explain_null():
 
 
 def test_s1_dialysis_g5d():
-    """S1 修复（2026-08-13）回归：透析患儿 eGFR<15 → G5D（care 层据此给每月随访）。"""
+    """S1（2026-08-13）+ F1 裁决（2026-08-17）回归：透析患儿 → G5D（KDIGO 按透析状态定义）。
+
+    F1（十二审）：G5D 与 eGFR 数值无关——KDIGO/NICE/PRNT 把透析依赖患儿单独列为
+    G5D（随访每月一次），透析患儿即使残余肾功能尚可（eGFR 15-30 常见）也按 G5D
+    管理。此前的"eGFR≥15 仍按数值分期"（G4/60 天随访）与 KDIGO 实践相悖，已修正。
+    """
     from CKDNutri_assessment_mcp import core
 
     # 透析 + eGFR<15 → G5D（hemodialysis / peritoneal / 大小写容错）
     for mode in ("hemodialysis", "peritoneal", "Hemodialysis"):
         r = core.classify_ckd(egfr=12.0, dialysis_mode=mode)
         assert r["data"]["g"] == "G5D", (mode, r)
+    # F1 裁决：透析 + eGFR≥15（残余肾功能尚可）→ **仍 G5D**（KDIGO 透析状态优先）
+    for egfr in (18.0, 25.0, 45.0):
+        assert core.classify_ckd(egfr=egfr, dialysis_mode="hemodialysis")["data"]["g"] == "G5D", egfr
     # 非透析 eGFR<15 → G5（G5D 不误报）
     assert core.classify_ckd(egfr=12.0)["data"]["g"] == "G5"
     assert core.classify_ckd(egfr=12.0, dialysis_mode="none")["data"]["g"] == "G5"
-    # 透析但 eGFR≥15 → 仍按数值分期（不透支 G5D）
-    assert core.classify_ckd(egfr=18.0, dialysis_mode="hemodialysis")["data"]["g"] == "G4"
-    # dialysis_mode 非字符串 → ValueError（fail-closed）
-    try:
-        core.classify_ckd(egfr=12.0, dialysis_mode=123)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("dialysis_mode=123 应抛 ValueError")
+    # 非透析 eGFR≥15 → 数值分期不受影响
+    assert core.classify_ckd(egfr=18.0)["data"]["g"] == "G4"
+    # dialysis_mode 非字符串 → ValueError（fail-closed；F3：任何 eGFR 下都校验）
+    for bad in (123, "hemodialysls"):
+        try:
+            core.classify_ckd(egfr=12.0, dialysis_mode=bad)
+            raise AssertionError(f"dialysis_mode={bad!r} 应抛 ValueError")
+        except ValueError:
+            pass
     # DAG 端到端透传：透析 G5D / 非透析 G5
     dag = core.assess_clinical_status(age_years=6, height_cm=115,
                                       serum_creatinine_mgdl=4.0,

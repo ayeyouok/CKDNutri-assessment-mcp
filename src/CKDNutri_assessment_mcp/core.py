@@ -55,24 +55,21 @@ _LEVEL_RANK = {"L1": 3, "L2": 2, "L3": 1, "none": 0}
 def _egfr_to_g(egfr: float, dialysis_mode: Optional[str] = None) -> str:
     """KDIGO 2024 儿童 eGFR 分期（ml/min/1.73m2）。
 
-    S1 修复（2026-08-13）：支持透析患儿 G5D——KDIGO/NICE/PRNT 把透析患儿单独
-    列为 G5D（随访每月一次），与 G5（每 60 天）不同。仅当 eGFR<15（已入 G5 域）
-    且 dialysis_mode 非空/非 none 时返回 G5D；eGFR 未跌入 G5 前仍按数值分期。
+    F1 裁决（2026-08-17，十二审）：**G5D 按透析状态定义，与 eGFR 数值无关**——
+    KDIGO/NICE/PRNT 把透析依赖患儿单独列为 G5D（随访每月一次），透析患儿即使
+    残余肾功能尚可（eGFR 15-30 常见）也应按 G5D 管理。此前 dialysis_mode 检查在
+    egfr>=15 数值分期之后，透析患儿被归 G4/G3b（随访 60 天 vs G5D 30 天，
+    节奏减半）。现透析检查提前到数值分期之前（约 2 行重排）。
+    注：S1（2026-08-13）原注释"eGFR 未跌入 G5 前仍按数值分期"是有意设计，但
+    与 KDIGO 实践相悖，本轮裁决修正（临床安全方向：透析随访更密）。
     """
-    if egfr >= 90:
-        return "G1"
-    if egfr >= 60:
-        return "G2"
-    if egfr >= 45:
-        return "G3a"
-    if egfr >= 30:
-        return "G3b"
-    if egfr >= 15:
-        return "G4"
-    # P4-3（2026-08-15）：dialysis_mode 白名单校验——此前任意非空非 "none" 字符串
-    # （"yes"/"NoNe "/"0" 等录入错误）都被判 G5D（fail-open）。server 层已有
-    # Literal 枚举拦截，但 core 是纯函数可被编排层直调（绕过 server），补同口径
-    # 白名单：仅显式透析模式才判 G5D，其余拒绝（录入错误不应静默升为透析分期）。
+    # F1/F3（2026-08-17）：dialysis_mode 白名单校验提前到数值分期之前——① 透析
+    # 状态优先判 G5D（无论 eGFR）；② 录入错误（"hemodialysls" 等）在**任何** eGFR
+    # 下都显式拒绝（此前仅 eGFR<15 才触发 raise，eGFR≥15 时被静默忽略 = fail-open）。
+    # P4-3（2026-08-15）：白名单校验——此前任意非空非 "none" 字符串（"yes"/
+    # "NoNe "/"0" 等录入错误）都被判 G5D（fail-open）。server 层已有 Literal 枚举
+    # 拦截，但 core 是纯函数可被编排层直调（绕过 server），补同口径白名单：仅显式
+    # 透析模式才判 G5D，其余拒绝（录入错误不应静默升为透析分期）。
     if dialysis_mode:
         dm = dialysis_mode.strip().lower()
         if dm == "none":
@@ -83,6 +80,16 @@ def _egfr_to_g(egfr: float, dialysis_mode: Optional[str] = None) -> str:
             raise ValueError(
                 f"dialysis_mode 必须是 none / hemodialysis / peritoneal 之一，收到："
                 f"{dialysis_mode!r}")
+    if egfr >= 90:
+        return "G1"
+    if egfr >= 60:
+        return "G2"
+    if egfr >= 45:
+        return "G3a"
+    if egfr >= 30:
+        return "G3b"
+    if egfr >= 15:
+        return "G4"
     return "G5"
 
 
@@ -462,13 +469,21 @@ def _risk_note(g: str, a: Optional[str]) -> str:
     # S1 修复（2026-08-13）：G5D 与 G5 同属最高风险档（rank=5）
     g_rank = {"G1": 0, "G2": 1, "G3a": 2, "G3b": 3, "G4": 4, "G5": 5, "G5D": 5}[g]
     a_rank = {"A1": 0, "A2": 1, "A3": 2}.get(a or "A1", 0)
-    score = g_rank + a_rank
-    if score >= 6:
+    # F2（2026-08-17，十二审）：**G 阶段地板**——KDIGO 2024 风险热图把 G4/G5/G5D
+    # 定义为高进展风险（红色区），**与白蛋白尿无关**（G4/G5 无论 A1/A2/A3 都是高
+    # 风险）。此前纯加性评分 g_rank+a_rank 阈值 ≥6 高：G4 A1=4、G5 A1=5、G5D A1=5
+    # 全落"中等"（3-6 月随访）→ 透析/晚期患儿被建议 3-6 月随访且风险文案降级，
+    # 临床分级不足。加地板：G4+ 直接判高（与 KDIGO 热图一致）。
+    if g in ("G4", "G5", "G5D"):
         note = "进展风险高：建议缩短随访间隔（如 1–3 个月）并由肾科密切管理。"
-    elif score >= 3:
-        note = "进展风险中等：建议 3–6 个月随访一次。"
     else:
-        note = "进展风险低：建议 6–12 个月常规随访。"
+        score = g_rank + a_rank
+        if score >= 6:
+            note = "进展风险高：建议缩短随访间隔（如 1–3 个月）并由肾科密切管理。"
+        elif score >= 3:
+            note = "进展风险中等：建议 3–6 个月随访一次。"
+        else:
+            note = "进展风险低：建议 6–12 个月常规随访。"
     # BUG-58（2026-08-12）：a=None（未提供 UACR / 仅提供 UPCR）时评分按无白蛋白尿计，
     # 可能低估进展风险——显式注明白蛋白尿未计入，提示补充 UACR 复评（透明，不捏造分期）。
     if a is None:
