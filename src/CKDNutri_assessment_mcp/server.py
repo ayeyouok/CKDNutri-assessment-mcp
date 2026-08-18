@@ -59,7 +59,7 @@ def assess_clinical_status_tool(
     sex: Optional[Literal["M", "F"]] = None,
     uacr_mg_g: Optional[float] = None,
     upcr_mg_g: Optional[float] = None,
-    upcr_mg_mmol: Optional[float] = None,  # M-5（2026-08-16）：UPCR mg/mmol（P1 契约单位），自动 ÷8.84
+    upcr_mg_mmol: Optional[float] = None,  # M-5（2026-08-16）：UPCR mg/mmol（P1 契约单位），自动 ×8.84 转 mg/g（P4 注释修正：mg/mmol→mg/g 是乘法，此前误写 ÷）
     bun_mg_dl: Optional[float] = None,
     k_value: Optional[float] = None,
     method: Optional[Literal["bedside2009", "classic"]] = None,  # M-1：revised2009 假公式已移除（CKiD 组合式需胱抑素 C，未实现）
@@ -93,7 +93,9 @@ def assess_clinical_status_tool(
       ca_mmol_L, na_mmol_L, ua_umol_L, egfr_ml_min, bun_mmol_L(×2.8),
       bun_mg_dl/bun_mg_dL, uacr_mg_g（若 P1 返回）, upcr_mg_mmol（×8.84 转 mg/g，
       P1 UPCR 契约键）, upcr_mg_g（键名匹配不区分大小写）。
-    规则引擎仅识别上述 Key；未识别的 Key 会被忽略导致对应规则静默跳过。
+    规则引擎仅识别上述 Key；未识别的 Key 中，**负值/NaN/Inf 会显式 INVALID_INPUT 拒绝**
+    （fail-closed，见 _normalize_labs），仅有限非负的未知键被静默忽略（不影响已识别
+    规则）；µ/μ（U+00B5/U+03BC）与 ASCII u 等价（键名域已归一）。
     prior_labs（上轮同指标历史值，可选）键名同 new_labs，用于动态趋势类规则
     （scr/egfr 环比），缺失则趋势规则不触发。
 

@@ -63,6 +63,14 @@ def _egfr_to_g(egfr: float, dialysis_mode: Optional[str] = None) -> str:
     注：S1（2026-08-13）原注释"eGFR 未跌入 G5 前仍按数值分期"是有意设计，但
     与 KDIGO 实践相悖，本轮裁决修正（临床安全方向：透析随访更密）。
     """
+    # P3-3（2026-08-18）：直调防护——本函数可被编排层直接 import（docstring 明示），
+    # NaN/Inf 此前静默误分期（_egfr_to_g(NaN)→G5、_egfr_to_g(Inf)→G1，全部分支比较
+    # 对 NaN 恒 False）；显式拒绝非有限/负值（fail-closed，与上游 calc_egfr_schwartz
+    # 的 BUG-58 校验同口径）。
+    if not math.isfinite(egfr):
+        raise ValueError(f"egfr 必须为有限数值（收到 {egfr!r}）")
+    if egfr < 0:
+        raise ValueError(f"egfr 不能为负（收到 {egfr!r}），eGFR 物理上不可能为负")
     # F1/F3（2026-08-17）：dialysis_mode 白名单校验提前到数值分期之前——① 透析
     # 状态优先判 G5D（无论 eGFR）；② 录入错误（"hemodialysls" 等）在**任何** eGFR
     # 下都显式拒绝（此前仅 eGFR<15 才触发 raise，eGFR≥15 时被静默忽略 = fail-open）。
@@ -95,6 +103,10 @@ def _egfr_to_g(egfr: float, dialysis_mode: Optional[str] = None) -> str:
 
 def _acr_to_a(uacr_mg_g: float) -> str:
     """白蛋白尿 A 期：UACR mg/g（KDIGO 2024 阈值 30/300）。"""
+    # P3-3（2026-08-18）：直调防护——NaN 所有比较恒 False → 静默 A3（最重分期）、
+    # -5 → A1（漏报）；显式拒绝非有限/负值。
+    if not math.isfinite(uacr_mg_g) or uacr_mg_g < 0:
+        raise ValueError(f"uacr_mg_g 必须为不小于 0 的有限数值（收到 {uacr_mg_g!r}）")
     if uacr_mg_g < 30:
         return "A1"
     if uacr_mg_g <= 300:
@@ -118,6 +130,10 @@ def _pcr_to_a(upcr_mg_g: float) -> str:
     UPCR 与 UACR 不等价（UPCR 含球蛋白），但 UPCR 是更常用的筛查指标，KDIGO 提供
     蛋白尿 P1/P2/P3 分级（<200 / 200–500 / >500 mg/g，儿科），此处按产品约定映射。
     """
+    # P3-3（2026-08-18）：直调防护（同 _acr_to_a）——NaN 所有比较恒 False → A3、
+    # -5 → A1，静默误分期拒绝。
+    if not math.isfinite(upcr_mg_g) or upcr_mg_g < 0:
+        raise ValueError(f"upcr_mg_g 必须为不小于 0 的有限数值（收到 {upcr_mg_g!r}）")
     if upcr_mg_g < _UPCR_A1_BOUND_MG_G:
         return "A1"
     if upcr_mg_g <= _UPCR_A3_BOUND_MG_G:
@@ -150,8 +166,16 @@ def _schwartz_k(age_years: float, k_value: Optional[float], is_preterm: bool = F
     k_value 显式传入优先。早产修正与 ≥13y 性别分化是关键临床项（用错可致 eGFR
     高估 27-36% 并误分期），调用方须按病史与性别正确传参。
     """
+    # P3-3（2026-08-18）：直调防护——k_value=-1/NaN 显式传入会静默产出负/NaN eGFR
+    # （上游 calc_egfr_schwartz 已校验，直调路径此前穿透）；年龄 NaN 全部分支比较
+    # 恒 False → 静默套 0.70（成年男性 k）。显式拒绝。
+    if not math.isfinite(age_years) or age_years < 0:
+        raise ValueError(f"age_years 必须为不小于 0 的有限数值（收到 {age_years!r}）")
     if k_value is not None:
-        return float(k_value)
+        fv = float(k_value)
+        if not math.isfinite(fv) or fv <= 0:
+            raise ValueError(f"k_value 必须为 > 0 的有限数值（收到 {k_value!r}）")
+        return fv
     if age_years < 1:
         return 0.33 if is_preterm else 0.45
     if age_years < 13:
@@ -270,7 +294,7 @@ def calc_egfr_schwartz(
     # 以上才是必然的录入错误/单位错配（儿童生理上限 ~230）。
     if egfr > 250:
         raise ValueError(
-            f"eGFR 计算结果 {egfr:.1f} ml/min/1.73m² 超出儿童生理合理上限（>250），"
+            f"eGFR 计算结果 {egfr:.2f} ml/min/1.73m² 超出儿童生理合理上限（>250），"
             "通常是身高/肌酐录入错误或单位错配，请核查数据")
     egfr_rounded = round(egfr, 1)
     # N1 修复（2026-08-13）：**未 round 值判级、round 值展示**——此前 round(egfr,1)
@@ -681,7 +705,7 @@ def _validate_rules_schema(rules_doc: Dict[str, Any]) -> None:
 
 
 def _pct_change(new: float, old: float) -> float:
-    """相对变化百分比（正=升，负=降）。old<=1e-9 或任一值为 NaN/Inf 视为无效。
+    """相对变化百分比（正=升，负=降）。old<=1e-6 或任一值为 NaN/Inf 视为无效。
 
     BUG-58（2026-08-12）：原 `old is None` 判断位于 float(old) 之后属死代码
     （None 会在 float() 抛 TypeError 提前返回）；且 NaN 穿透 `old <= 0` 比较后
@@ -689,7 +713,7 @@ def _pct_change(new: float, old: float) -> float:
     2026-08-12（系统性审查，P1）：极小正基线（如 o=1e-321 的微量化验值/浮点误差）
     使 (n-o)/o*100 产生 inf 或 1e300 级巨值——上层 `pct != pct` 只拦 NaN、拦不住
     inf，命中趋势规则后 `round(abs(pct),1)` 抛 OverflowError 击穿 fail-closed。
-    ① 基线阈值收紧至 o<=1e-9（正常化验值量级远大于此，不受影响）；
+    ① 基线阈值收紧至 o<=1e-6（正常化验值量级远大于此，不受影响）；
     ② 计算结果二次有限性校验（防分母非极小但分子极端导致的 inf/nan）。
     """
     try:
@@ -766,6 +790,11 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
         pct = _pct_change(new_labs[metric], prior_labs[metric])
         if pct != pct:  # NaN
             return None
+        # P3-1（2026-08-18）：判级前 round 6 位消除浮点尘埃——78.026/60.02 数学恰
+        # 30.0% 实算 29.99999...9（闭端 30 不命中）、90.03/60.02 恰 50.0% 实算
+        # 49.9999...9（R-01 ≥50% 危急降级 R-08）；阈值均为整数，round 6 位既消尘埃
+        # 又不引入新误判（判级与展示共用该值，审计可复现）。
+        pct = round(pct, 6)
         direction = rule["direction"]
         if direction == "up":
             if "low_pct" in rule:  # 区间型（如 R-08 30-50%）
@@ -799,7 +828,12 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
             # 下降为负（-35.0），与阈值描述（"down [30%, 50%)"）同框展示时负数直观上
             # "不在区间内"引发 UI/临床困惑。方向语义已由 threshold 文本承载，取绝对值
             # 不丢信息；up 方向 pct 恒正，abs 无影响。
-            "observed": round(abs(pct), 1),
+            # P2-3（2026-08-18）：round 1→**floor 3 位**——此前 round(abs,1) 把
+            # pct=49.983 显示成 50.0 越出自身 [30,50) 上界（审计显示与阈值矛盾）；
+            # round3 仍会把尘埃级 49.9998 上取整为 50.0；floor 3 位**永不虚增跨上界**
+            # （49.999833→49.999 仍在带内，R-01 恰 50.0 在 ">=50%" 语义下保持 50.0
+            # 且命中边界，双向一致）。
+            "observed": math.floor(abs(pct) * 1000.0) / 1000.0,
             "threshold": thresh_str,
             "unit": "%",
         }
@@ -875,6 +909,11 @@ def _normalize_labs(labs: Optional[Dict[str, float]]) -> Optional[Dict[str, floa
         return labs
     out: Dict[str, float] = {}
     for k, v in labs.items():
+        # P3-4（2026-08-18）：**键名 µ→u 归一**——值域单位串（_normalize_unit_str）
+        # 已做 µ→u，键名域此前未做："scr_μmol_L"（U+03BC 希腊字母 μ）与
+        # "scr_umol_L"（ASCII u）字面不同 → _LAB_ALIAS_TO_RULE 匹配不到 → scr 规则
+        # 静默跳过（overall_level="none" 假无风险，fail-open）；两域现对称归一。
+        k = k.replace("µ", "u").replace("μ", "u")
         fv = _require_finite(v, f"labs[{k!r}]")
         # A-B2 修复（2026-08-14）：规则路径物理区间校验（fail-closed，对齐 eGFR 计算
         # 路径）——此前 {"hb": -10} 触发"重度贫血 R-04"、负 eGFR 参与 AKI 判定，
@@ -887,7 +926,18 @@ def _normalize_labs(labs: Optional[Dict[str, float]]) -> Optional[Dict[str, floa
     # lower 化，但此处键名此前严格区分大小写：上游/P1 若传 Scr_umol_L、bun_mg_DL 等变体
     # 无法识别 → scr/bun 相关规则静默跳过 → overall_level="none" 假无风险。现用 lower_map
     # 归一化查找（短名仍精确匹配原样保留，不受影响）。
-    lower_map = {k.lower(): k for k in out}
+    # P2-1（2026-08-18）：**大小写变体重复键拒绝**——此前 `{k.lower(): k for k in out}`
+    # 字典推导把 scr_mg_dl 与 scr_mg_dL 折叠为单键（后者覆盖前者），冲突检测只看得到
+    # 一份 → 88.4 倍单位冲突被静默吞掉（审查报告2 的 fail-closed 修复可被大小写变体
+    # 绕过）。现显式检测：同 lower 键出现多个原键 → 拒绝（歧义输入 fail-closed）。
+    lower_map: Dict[str, str] = {}
+    for _k in out:
+        _lk = _k.lower()
+        if _lk in lower_map and lower_map[_lk] != _k:
+            raise ValueError(
+                f"指标键名大小写变体冲突：{lower_map[_lk]!r} 与 {_k!r} 同源（{_lk}），"
+                f"请只传一种写法（歧义输入拒绝）")
+        lower_map[_lk] = _k
     # 2026-08-18（审查报告2 P1）：单位冲突 fail-closed——同一 canonical short 的多个
     # 来源键（如 scr_umol_L 与 scr_mg_dl 差 88.4×）值不一致时**拒绝**（此前静默取先者，
     # 88.4× 冲突被吞，与 classify_ckd 双单位 UPCR 拒绝口径一致）。
@@ -903,6 +953,13 @@ def _normalize_labs(labs: Optional[Dict[str, float]]) -> Optional[Dict[str, floa
                 f"（{matched_key}={norm} 与既有 {short}={alias_norm[short]}），"
                 f"请只传一种单位的 {short}。")
         alias_norm[short] = norm
+        # P2-2（2026-08-18）：**短名直传与完整键换算一致性**——此前 `short in out`
+        # 时跳过归一化（短名恒胜静默），{"scr":2.0,"scr_umol_L":88.4}（=1.0 mg/dL）
+        # 88.4 倍冲突无告警；现显式比较，不一致拒绝（与"全键-全键必报错"对称）。
+        if short in out and abs(out[short] - norm) > 1e-6:
+            raise ValueError(
+                f"指标 {short!r} 短名直传与完整键换算冲突：{short}={out[short]} 与 "
+                f"{matched_key}={norm} 不一致，请只传一种口径")
         if short not in out:
             out[short] = norm
     # A-B5 修复（2026-08-14）：**短名键也大小写容错**；若与上面归一化值冲突则报错。
@@ -1108,6 +1165,13 @@ def explain_verdict(evaluation: Dict[str, Any]) -> Dict[str, Any]:
         missing = [f for f in _MATCHED_RULE_FIELDS if f not in m]
         if missing:
             raise ValueError(f"matched_rules[{i}] 缺少字段: {missing}")
+        # P3-2（2026-08-18）：observed 有限性校验——7 字段此前只查"存在"不查"有限"，
+        # observed=NaN 直穿进判定链，工具层 json.dumps(allow_nan=False) 失败（响应
+        # 生成崩溃）；NaN/Inf/非数值一律 INVALID_INPUT（fail-closed）。
+        if isinstance(m["observed"], bool) or not isinstance(m["observed"], (int, float)) \
+                or not math.isfinite(m["observed"]):
+            raise ValueError(
+                f"matched_rules[{i}].observed 必须为有限数值（收到 {m['observed']!r}）")
     for m in matched_rules:
         chain.append({
             "rule_id": m["id"],
