@@ -143,3 +143,103 @@ def test_p44_egfr_rejection_message_precision():
         assert "2065.00" in str(exc), str(exc)  # .2f 显示真实值（.1f 会显示 2065.0 丢失精度）
     else:
         raise AssertionError("eGFR>250 应拒绝")
+
+
+def test_p41_explicit_param_vs_new_labs_conflict():
+    """P1-1（四审）：显式参数与 new_labs 同指标不一致拒绝——uacr_mg_g=30 与
+    new_labs={"uacr":500} 双源冲突此前静默以显式参数覆盖。"""
+    from CKDNutri_assessment_mcp import core
+
+    try:
+        core.assess_clinical_status(
+            age_years=8, height_cm=120, serum_creatinine_mgdl=1.0,
+            uacr_mg_g=30.0, new_labs={"uacr": 500.0})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("显式参数与 new_labs 冲突未拒绝")
+    # 一致时放行
+    r = core.assess_clinical_status(
+        age_years=8, height_cm=120, serum_creatinine_mgdl=1.0,
+        uacr_mg_g=30.0, new_labs={"uacr": 30.0})
+    assert r["ok"] is True, r
+
+
+def test_p42_rules_schema_bool_and_negative_rejected():
+    """P1-2/P1-3（四审）：rules.json Schema 拒绝 bool 阈值与负趋势阈值。"""
+    from CKDNutri_assessment_mcp import core
+
+    bool_rule = {"rules": [{"id": "T1", "name": "t", "level": "L1", "metric": "k",
+                            "type": "absolute", "operator": "gt", "threshold": True,
+                            "unit": "mmol/L", "description": "d"}]}
+    try:
+        core._validate_rules_schema(bool_rule)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("bool threshold 未被 schema 拒绝")
+    neg_rule = {"rules": [{"id": "T2", "name": "t", "level": "L1", "metric": "scr",
+                           "type": "trend_pct", "direction": "up", "threshold_pct": -20,
+                           "unit": "%", "description": "d"}]}
+    try:
+        core._validate_rules_schema(neg_rule)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("负 threshold_pct 未被 schema 拒绝")
+
+
+def test_p44_heatmap_fail_closed():
+    """P1-4（四审）：风险热图未映射组合 → RuntimeError（不再静默兜底"中"）。"""
+    from CKDNutri_assessment_mcp import core
+
+    try:
+        core._risk_note("G6", "A1")  # 热图未覆盖的分期组合
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("未映射 (G,A) 组合未 fail-closed")
+    # 正常组合不受影响
+    assert "低" in core._risk_note("G1", "A1")
+
+
+def test_p45_normalize_full_precision_threshold():
+    """P1-5（四审）：内部全精度——k_mmol_L=5.50001 不再 round4 截断成 5.5，
+    R-02（k>5.5）必须命中（临界值不漏检）。"""
+    from CKDNutri_assessment_mcp import core
+
+    out = core._normalize_labs({"k_mmol_L": 5.50001})
+    assert out["k"] == 5.50001, out  # 全精度保留
+    r = core.evaluate_risk_rules({"k_mmol_L": 5.50001})
+    hits = [(h["id"], h["level"]) for h in (r.get("data") or {}).get("matched_rules", [])]
+    assert ("R-02", "L2") in hits, hits  # K>5.5 高钾血症命中
+
+
+def test_p46_is_preterm_bool_guard():
+    """P1-6（四审）：is_preterm 字符串 "false" 拒绝（truthy 此前误判早产）。"""
+    from CKDNutri_assessment_mcp import core
+
+    try:
+        core.calc_egfr_schwartz(age_years=0.5, height_cm=60,
+                                serum_creatinine_mgdl=0.4, is_preterm="false")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('is_preterm="false" 未被拒绝')
+
+
+def test_p47_unknown_sex_over13_rejected():
+    """P1-7（四审）：≥13 岁 classic 未知性别拒绝（此前静默按男性 k=0.70）。"""
+    from CKDNutri_assessment_mcp import core
+
+    try:
+        core.calc_egfr_schwartz(age_years=14, height_cm=150,
+                                serum_creatinine_mgdl=1.0, sex="未知", method="classic")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("≥13 岁未知性别未拒绝")
+    # sex=None（未提供）向后兼容放行
+    r = core.calc_egfr_schwartz(age_years=14, height_cm=150,
+                                serum_creatinine_mgdl=1.0, method="classic")
+    assert r["ok"] is True, r

@@ -103,8 +103,10 @@ def assess_clinical_status_tool(
     risk_completeness, warnings} 全链路聚合。
 
     dialysis_mode（可选，A-S1 修复 2026-08-14）：none / hemodialysis / peritoneal——
-    eGFR<15 且透析时分期标注 G5D（此前工具入口缺该参数，透析患儿经 MCP 评估
-    永远返回 G5 而非 G5D，测试仅覆盖 core 层恰好掩盖）。
+    **只要处于透析状态即归 G5D（与 eGFR 数值无关，F1 十二审裁决）**——KDIGO/NICE/PRNT
+    把透析依赖患儿单独列为 G5D（随访每月一次），透析患儿即使残余肾功能尚可（eGFR
+    15-30 常见）也按 G5D 管理（此前 docstring 误写"eGFR<15 且透析时 G5D"与代码不符，
+    P2-3 修正 2026-08-18）。
     """
     try:
         return assess_clinical_status(

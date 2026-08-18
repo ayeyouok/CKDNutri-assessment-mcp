@@ -5,13 +5,14 @@
 
 公式来源与口径（ADR-006）：
 - eGFR（床旁 Schwartz 2009）：eGFR = 0.413 × 身高(cm) / Scr(mg/dL)，结果以 ml/min/1.73m2 计。
-  这是当前 KDIGO / 中国儿科 CKD 随访最常用的体表面积标准化估算式。
-- eGFR（含 BUN 修订 Schwartz 2009）：当提供 BUN 且怀疑 eGFR<60 时采用
-  eGFR = 0.413 × 身高 / (Scr + 0.003×BUN − 0.024)，对低 eGFR 儿童更准确。
+  这是当前 KDIGO / 中国儿科 CKD 随访最常用的体表面积标准化估算式（BUN 不参与）。
 - eGFR（经典 k 值 Schwartz）：eGFR = k × 身高 / Scr，k 随年龄/成熟度的默认取值：
   早产儿 0.33、足月儿(<1y) 0.45、儿童(1–12y) 0.55、青少年(≥13y) 0.70；允许显式覆盖 k_value。
 - CKD 分期（KDIGO 2024 儿童）：仅按 eGFR 分 G1–G5；白蛋白尿按 UACR(mg/g) 或 UPCR(mg/g) 分 A1–A3；
   合并分期写作 GxAx（如 G3aA2）。<2 岁婴儿的 eGFR 阈值与年长儿不同，已在 note 中警示。
+- M-1（2026-08-15）：含 BUN 修订 Schwartz 2009（eGFR = 0.413×H/(Scr+0.003×BUN−0.024)）
+  已移除——无文献出处的自造线性式；BUN 参与修订需 CKiD 组合式（幂函数且必需胱抑素 C），
+  本系统未实现。method 仅支持 bedside2009 / classic。
 """
 from __future__ import annotations
 
@@ -213,9 +214,24 @@ def calc_egfr_schwartz(
     """
     caller = get_caller()
     enforce_read(MCP_NAME)
+    # P1-6（2026-08-18）：is_preterm 严格 bool——绕过 server 直调 core 时字符串
+    # "false" 为 truthy 会误判早产（k=0.33，eGFR 高估 36%）；显式类型校验。
+    if not isinstance(is_preterm, bool):
+        raise ValueError(
+            f"is_preterm 必须为 bool（收到 {is_preterm!r}）——字符串 'false' 是 truthy，"
+            "禁止类型隐式转换")
     # 2026-08-12（系统性审查，P3）：sex 入口归一化一次，sex_note 复用归一化值
     # （_schwartz_k 内部保留 _normalize_sex 防御直接调用者，幂等无副作用）。
+    # P1-7（2026-08-18）：≥13 岁 classic 未知性别拒绝——此前无法识别的 sex 归 None
+    # 静默按男性 k=0.70 计算（eGFR 高估 27%）；显式传入但无法识别 = 录入错误。
+    _sex_raw = str(sex).strip() if sex is not None else None
     sex = _normalize_sex(sex)
+    if (method == "classic" and _sex_raw and sex is None
+            and age_years is not None and not isinstance(age_years, bool)
+            and isinstance(age_years, (int, float)) and age_years >= 13):
+        raise ValueError(
+            f"sex={_sex_raw!r} 无法识别（≥13 岁 classic 式 k 值依赖性别，男性 0.70/"
+            f"女性 0.55）：请传 M/F/male/female/男/女，禁止静默默认男性")
     if method not in ("bedside2009", "classic"):
         # M-1（2026-08-15）：revised2009 已移除（无文献出处的自造线性式）
         if method == "revised2009":
@@ -542,7 +558,14 @@ def _risk_note(g: str, a: Optional[str]) -> str:
         # 白蛋白尿未计入：无法按 KDIGO 热图评估，显式提示补充 UACR，绝不捏造低风险。
         return ("白蛋白尿 A 分期未计入 KDIGO 风险热图（未提供 UACR / 仅提供 UPCR）；"
                 "实际进展风险可能更高，请补充 UACR 后复评。")
-    tier = _RISK_HEATMAP.get((g, a), "中")
+    tier = _RISK_HEATMAP.get((g, a))
+    # P1-4（2026-08-18）：热图兜底 Fail-open 修复——此前 `.get((g,a), "中")` 对未映射
+    # 组合静默回退"中风险"（如未来新增 G 档/新 A 档组合时捏造风险结论）；未映射即
+    # 服务端数据/逻辑缺陷，显式抛错（fail-closed），杜绝医疗风险判定静默兜底。
+    if tier is None:
+        raise RuntimeError(
+            f"KDIGO 风险热图未覆盖组合 (G={g!r}, A={a!r})——服务端逻辑缺陷，"
+            "拒绝静默兜底判定，请补全 _RISK_HEATMAP")
     if tier == "高":
         return "进展风险高：建议缩短随访间隔（如 1–3 个月）并由肾科密切管理。"
     if tier == "中":
@@ -637,6 +660,13 @@ def _validate_rules_schema(rules_doc: Dict[str, Any]) -> None:
     # "ks"）静默跳过该规则 → overall_level="none" 给临床"无风险"假象（fail-open）。
     _VALID_RULE_METRICS = frozenset(short for _, (short, _f) in
                                     ((k, v) for k, v in _LAB_ALIAS_TO_RULE.items()))
+
+    def _is_real_number(v: Any) -> bool:
+        # P1-2（2026-08-18）：严格数值判定——`isinstance(True, (int,float))` 为 True，
+        # {"threshold": true} 此前绕过校验并被当作 1 参与运算；bool 显式排除。
+        return isinstance(v, (int, float)) and not isinstance(v, bool) \
+            and math.isfinite(v)
+
     for r in rules:
         if not isinstance(r, dict):
             raise RuntimeError(f"规则条目 {r!r} 非字典，拒绝加载")
@@ -659,16 +689,17 @@ def _validate_rules_schema(rules_doc: Dict[str, Any]) -> None:
                     f"规则 {r['id']} operator={op!r} 非法，必须是 {sorted(_VALID_ABS_OPS)}")
             if op == "between":
                 low, high = r.get("low"), r.get("high")
-                if not (isinstance(low, (int, float)) and isinstance(high, (int, float))
-                        and math.isfinite(low) and math.isfinite(high) and low < high):
+                if not (_is_real_number(low) and _is_real_number(high) and low < high):
                     raise RuntimeError(
-                        f"规则 {r['id']} between 需 low < high 有限数值，收到 low={low!r} high={high!r}")
+                        f"规则 {r['id']} between 需 low < high 有限数值（bool 拒绝），"
+                        f"收到 low={low!r} high={high!r}")
             else:
                 thr = r.get("threshold")
                 # 2026-08-18（审查报告2 P2）：单边阈值须为有限数值——json.load 接受
                 # NaN/Inf 字面量，isinstance 校验挡不住；NaN 阈值令 v>nan 恒 False，
                 # L1 危急规则被静默"死亡"（fail-open）。显式 isfinite 拦截。
-                if not isinstance(thr, (int, float)) or math.isnan(thr) or math.isinf(thr):
+                # P1-2（2026-08-18）：bool 显式排除（isinstance(True,int) 穿透）。
+                if not _is_real_number(thr):
                     raise RuntimeError(
                         f"规则 {r['id']} 单边 operator 需有限数值 threshold，收到 {thr!r}")
         elif r["type"] == "trend_pct":
@@ -687,18 +718,22 @@ def _validate_rules_schema(rules_doc: Dict[str, Any]) -> None:
                     f"当前同时提供")
             if has_range:
                 low_pct, high_pct = r.get("low_pct"), r.get("high_pct")
-                if not (isinstance(low_pct, (int, float)) and isinstance(high_pct, (int, float))
-                        and math.isfinite(low_pct) and math.isfinite(high_pct)
-                        and low_pct < high_pct):
+                # P1-3（2026-08-18）：趋势百分比阈值须**非负**——threshold_pct=-20 时
+                # up 方向 `pct >= -20` 对绝大多数值恒成立，正常下降被误判"上升"；
+                # low/high 负值同理破坏区间语义。
+                if not (_is_real_number(low_pct) and _is_real_number(high_pct)
+                        and 0.0 <= low_pct < high_pct):
                     raise RuntimeError(
-                        f"规则 {r['id']} 区间型趋势需 low_pct < high_pct 有限数值，收到 "
-                        f"low_pct={low_pct!r} high_pct={high_pct!r}")
+                        f"规则 {r['id']} 区间型趋势需 0 ≤ low_pct < high_pct 有限数值"
+                        f"（bool/负值拒绝），收到 low_pct={low_pct!r} high_pct={high_pct!r}")
             else:
                 tpct = r.get("threshold_pct")
                 # 2026-08-18（审查报告2 P2）：单边阈值须为有限数值（同 absolute 单边）。
-                if not isinstance(tpct, (int, float)) or math.isnan(tpct) or math.isinf(tpct):
+                # P1-3（2026-08-18）：须非负（负阈值令 up 方向恒命中，见上）。
+                if not _is_real_number(tpct) or tpct < 0:
                     raise RuntimeError(
-                        f"规则 {r['id']} 单阈值趋势需有限数值 threshold_pct，收到 {tpct!r}")
+                        f"规则 {r['id']} 单阈值趋势需 0 ≤ 有限数值 threshold_pct，"
+                        f"收到 {tpct!r}")
         else:
             raise RuntimeError(
                 f"规则 {r['id']} type={r['type']!r} 非法，必须是 absolute / trend_pct")
@@ -946,8 +981,12 @@ def _normalize_labs(labs: Optional[Dict[str, float]]) -> Optional[Dict[str, floa
         matched_key = lower_map.get(full_key.lower())
         if matched_key is None:
             continue
-        norm = round(out[matched_key] * factor, 4)
-        if short in alias_norm and abs(alias_norm[short] - norm) > 1e-6:
+        # P1-5（2026-08-18）：**内部全精度**——此前 `round(..., 4)` 截断中间值：
+        # k_mmol_L=5.50001 → 5.5 存储 → 规则 R-02（k>5.5）临界值漏检；换算与
+        # 冲突检测统一 math.isclose（rel 1e-9 / abs 1e-6），仅展示层保留舍入。
+        norm = out[matched_key] * factor
+        if short in alias_norm and not math.isclose(alias_norm[short], norm,
+                                                    rel_tol=1e-9, abs_tol=1e-6):
             raise ValueError(
                 f"指标 {short!r} 单位冲突：检测到两种单位取值不一致"
                 f"（{matched_key}={norm} 与既有 {short}={alias_norm[short]}），"
@@ -956,7 +995,8 @@ def _normalize_labs(labs: Optional[Dict[str, float]]) -> Optional[Dict[str, floa
         # P2-2（2026-08-18）：**短名直传与完整键换算一致性**——此前 `short in out`
         # 时跳过归一化（短名恒胜静默），{"scr":2.0,"scr_umol_L":88.4}（=1.0 mg/dL）
         # 88.4 倍冲突无告警；现显式比较，不一致拒绝（与"全键-全键必报错"对称）。
-        if short in out and abs(out[short] - norm) > 1e-6:
+        if short in out and not math.isclose(out[short], norm,
+                                             rel_tol=1e-9, abs_tol=1e-6):
             raise ValueError(
                 f"指标 {short!r} 短名直传与完整键换算冲突：{short}={out[short]} 与 "
                 f"{matched_key}={norm} 不一致，请只传一种口径")
@@ -968,7 +1008,7 @@ def _normalize_labs(labs: Optional[Dict[str, float]]) -> Optional[Dict[str, floa
         lk = key.lower()
         if lk in _short_set and lk != key:
             val = out.pop(key)
-            if lk in out and abs(out[lk] - val) > 1e-6:
+            if lk in out and not math.isclose(out[lk], val, rel_tol=1e-9, abs_tol=1e-6):
                 raise ValueError(
                     f"指标 {lk!r} 存在大小写键冲突：{key}={val} 与 {lk}={out[lk]} 不一致")
             out[lk] = val
@@ -1339,8 +1379,17 @@ def assess_clinical_status(
     _egfr_for_rules = egfr_r["data"].get("egfr_raw", egfr_r["data"]["egfr"])
     for k, v in (("scr", scr_mgdl), ("egfr", _egfr_for_rules),
                  ("bun", bun_mg_dl), ("uacr", uacr_mg_g), ("upcr", upcr_mg_g)):
-        if v is not None:
-            labs[k] = v
+        if v is None:
+            continue
+        # P1-1（2026-08-18）：显式参数与 new_labs 同指标冲突拒绝——此前静默以显式
+        # 参数覆盖 new_labs（如 uacr_mg_g=30 与 new_labs={"uacr":500} 时 500 被吞
+        # 无告警），双源不一致 = 数据歧义，fail-closed（与 _normalize_labs 单位冲突
+        # 同口径）。
+        if k in labs and not math.isclose(labs[k], v, rel_tol=1e-9, abs_tol=1e-6):
+            raise ValueError(
+                f"指标 {k!r} 冲突：显式参数={v} 与 new_labs 中 {k}={labs[k]} 不一致，"
+                f"请只传一个来源")
+        labs[k] = v
     # 2026-08-12（系统性审查，P3）：prior_labs 归一化前移一次，evaluate 与趋势完整性
     # 校验共用（evaluate 内部再归一化幂等无副作用）——此前两处各归一化一遍。
     norm_prior = _normalize_labs(prior_labs)
