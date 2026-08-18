@@ -243,3 +243,130 @@ def test_p47_unknown_sex_over13_rejected():
     r = core.calc_egfr_schwartz(age_years=14, height_cm=150,
                                 serum_creatinine_mgdl=1.0, method="classic")
     assert r["ok"] is True, r
+
+
+# ---- 十七审（2026-08-18）：纯函数直调防御 + 语义加固（P1-1~P1-5 / P2-1/2/4）----
+
+
+def test_p51_dag_entry_type_guard():
+    """P1-1：DAG 入口统一类型校验——age_years="0.5"/is_preterm="false" 拒绝
+    （此前字符串在 `is_preterm and age_years < 1` 处 TypeError）。"""
+    from CKDNutri_assessment_mcp import core
+
+    for bad_age in (float("nan"), float("inf")):
+        try:
+            core.assess_clinical_status(age_years=bad_age, height_cm=70,
+                                        serum_creatinine_mgdl=0.4)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"age_years={bad_age!r} 未拒绝")
+    # 数字字符串按项目契约（_require_finite float() 可解析即接受，不崩 TypeError）
+    r = core.assess_clinical_status(age_years="0.5", height_cm=70,
+                                    serum_creatinine_mgdl=0.4)
+    assert r["ok"] is True, r
+    try:
+        core.assess_clinical_status(age_years=0.5, height_cm=70,
+                                    serum_creatinine_mgdl=0.4, is_preterm="false")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('is_preterm="false" 未拒绝')
+
+
+def test_p52_labs_key_type_guard():
+    """P1-2：_normalize_labs 非字符串键拒绝（{123: 5.5} 此前 AttributeError）。"""
+    from CKDNutri_assessment_mcp import core
+
+    try:
+        core._normalize_labs({123: 5.5})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("非字符串键未拒绝")
+
+
+def test_p53_unknown_metrics_exposed():
+    """P1-3：未识别指标显式暴露（potassium 而非 k → unknown_metrics + 告警）。"""
+    from CKDNutri_assessment_mcp import core
+
+    r = core.assess_clinical_status(age_years=8, height_cm=120,
+                                    serum_creatinine_mgdl=0.8,
+                                    new_labs={"k": 5.5, "potassium": 7.0})
+    assert r["ok"] is True, r
+    rc = r["data"]["risk_completeness"]
+    assert "potassium" in rc["unknown_metrics"], rc
+    assert "未识别指标" in rc["note"], rc
+    # 合法非规则指标（uacr）不算 unknown
+    r2 = core.assess_clinical_status(age_years=8, height_cm=120,
+                                     serum_creatinine_mgdl=0.8,
+                                     new_labs={"k": 5.5, "uacr": 100.0})
+    assert "uacr" not in r2["data"]["risk_completeness"]["unknown_metrics"]
+
+
+def test_p54_completeness_structured():
+    """P1-4：risk_completeness 结构化字段（metric/trend_coverage/fully_evaluable）。"""
+    from CKDNutri_assessment_mcp import core
+
+    r = core.assess_clinical_status(age_years=8, height_cm=120,
+                                    serum_creatinine_mgdl=1.2,
+                                    new_labs={"k": 5.5, "scr": 1.2},
+                                    prior_labs={"scr": 1.0})
+    rc = r["data"]["risk_completeness"]
+    assert "metric_coverage" in rc and "covered" in rc["metric_coverage"], rc
+    assert "trend_coverage" in rc and "required" in rc["trend_coverage"], rc
+    assert "fully_evaluable" in rc, rc
+    # 缺 egfr 历史 → 趋势未完全覆盖 → fully_evaluable=False
+    assert rc["fully_evaluable"] is False, rc
+    assert rc["trend_coverage"]["missing"], rc
+
+
+def test_p55_level_rank_strict():
+    """P1-5：_LEVEL_RANK 严格索引——matched 规则非法 level 不再静默降级（整体评估正常）。"""
+    from CKDNutri_assessment_mcp import core
+
+    r = core.evaluate_risk_rules({"k": 6.0})  # R-02 命中 L2
+    assert r["ok"] is True and r["data"]["overall_level"] == "L2", r
+
+
+def test_p52_eval_rule_nan_guard():
+    """P2-1：_eval_rule 直调 NaN 拒绝（此前 NaN 比较恒 False 静默漏检）。"""
+    import math
+
+    from CKDNutri_assessment_mcp import core
+
+    rule = {"id": "R-02", "metric": "k", "type": "absolute",
+            "operator": "gt", "threshold": 5.5}
+    try:
+        core._eval_rule(rule, {"k": float("nan")}, None)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("NaN 直调 _eval_rule 未拒绝")
+
+
+def test_p52_explain_verdict_forged_id():
+    """P2-2：explain_verdict 拒绝伪造规则 ID（防判定链格式化器被滥用）。"""
+    from CKDNutri_assessment_mcp import core
+
+    fake = {"ok": True, "data": {"matched_rules": [
+        {"id": "FAKE-99", "name": "伪造", "level": "L1", "observed": 1.0,
+         "threshold": 0.5, "unit": "x", "description": "伪造"},
+    ], "overall_level": "L1", "evaluation_note": None}}
+    try:
+        core.explain_verdict(fake)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("伪造规则 ID 未被拒绝")
+
+
+def test_p52_dialysis_normalized():
+    """P2-4：assess 返回 dialysis_mode_normalized（归一化标准值）。"""
+    from CKDNutri_assessment_mcp import core
+
+    r = core.assess_clinical_status(age_years=8, height_cm=120,
+                                    serum_creatinine_mgdl=1.0,
+                                    dialysis_mode="HemoDialysis ")
+    assert r["ok"] is True, r
+    assert r["data"]["dialysis_mode_normalized"] == "hemodialysis", r["data"]

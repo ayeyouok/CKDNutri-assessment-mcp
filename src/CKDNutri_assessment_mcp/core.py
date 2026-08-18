@@ -779,6 +779,12 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
             v = float(new_labs[metric])  # 防御 JSON 序列化字符串类型
         except (ValueError, TypeError):
             return None
+        # P2-1（2026-08-18，十七审）：叶子函数直调防御——evaluate 主路径已 _require_finite，
+        # 但 _eval_rule 可被外部直接 import 调用：NaN 比较恒 False → 规则静默漏检
+        # （危急值不触发，fail-open）。显式拒绝（fail-closed，由调用方归 INVALID_INPUT）。
+        if isinstance(v, bool) or not math.isfinite(v):
+            raise ValueError(
+                f"规则 {rule.get('id', '?')} 的指标 {metric} 值必须为有限数值，收到 {v!r}")
         op = rule["operator"]
         if op == "gt":
             hit = v > rule["threshold"]
@@ -944,6 +950,12 @@ def _normalize_labs(labs: Optional[Dict[str, float]]) -> Optional[Dict[str, floa
         return labs
     out: Dict[str, float] = {}
     for k, v in labs.items():
+        # P1-2（2026-08-18，十七审）：键名类型强校验——此前 `k.replace("µ","u")`
+        # 对非字符串键（{123: 5.5}）抛 AttributeError（内部 bug 误报，绕过 server
+        # 直调时暴露）；显式 ValueError（INVALID_INPUT 语义）。
+        if not isinstance(k, str):
+            raise ValueError(
+                f"labs 键名必须为字符串，收到 {type(k).__name__}（值 {v!r}）")
         # P3-4（2026-08-18）：**键名 µ→u 归一**——值域单位串（_normalize_unit_str）
         # 已做 µ→u，键名域此前未做："scr_μmol_L"（U+03BC 希腊字母 μ）与
         # "scr_umol_L"（ASCII u）字面不同 → _LAB_ALIAS_TO_RULE 匹配不到 → scr 规则
@@ -1060,16 +1072,18 @@ def evaluate_risk_rules(
             "unit": detail["unit"],
         })
 
-    # 最高等级（防御性读取：rules.json 中未知等级默认 rank=0，不抛 KeyError）
+    # 最高等级（P1-5，2026-08-18：schema 已 fail-closed 校验 level ∈ {L1,L2,L3}，
+    # 运行时去掉 _LEVEL_RANK.get(...,0) 假防御——非法 level 直接 KeyError 由外层
+    # translate_error 归 INTERNAL_ERROR 暴露，而非静默按 none 权重处理）。
     overall = "none"
     for m in matched:
-        if _LEVEL_RANK.get(m["level"], 0) > _LEVEL_RANK.get(overall, 0):
+        if _LEVEL_RANK[m["level"]] > _LEVEL_RANK[overall]:
             overall = m["level"]
 
     # 2026-08-12（系统性审查，P3）：命中列表按风险等级降序（L1 危急优先）——rules.json
     # 文件顺序非等级序（如 R-01 L1 后紧跟 R-08 L3），医生/前端审阅 matched_rules 时
     # 应先见危急项再见低危项。overall_level 计算与顺序无关，此排序纯展示层无副作用。
-    matched.sort(key=lambda m: _LEVEL_RANK.get(m["level"], 0), reverse=True)
+    matched.sort(key=lambda m: _LEVEL_RANK[m["level"]], reverse=True)
 
     # 四审（2026-08-12）：空输入显式提示——编排层直接调 evaluate_risk_rules（绕过
     # DAG）传空/缺失 new_labs 时，overall_level="none" 会给"已全面评估且无风险"的
@@ -1095,7 +1109,7 @@ def evaluate_risk_rules(
             delta_note = "无历史等级对照（首次评估）"
         elif prior_level == overall:
             delta_note = f"与历史等级 {prior_level} 持平"
-        elif _LEVEL_RANK[overall] > _LEVEL_RANK.get(prior_level, 0):
+        elif _LEVEL_RANK[overall] > _LEVEL_RANK[prior_level]:  # P1-5（2026-08-18）：prior_level 已校验 ∈ _LEVEL_RANK，去 get 降级
             delta_note = f"较历史等级 {prior_level} 升高至 {overall}"
         else:
             delta_note = f"较历史等级 {prior_level} 降至 {overall}"
@@ -1199,9 +1213,17 @@ def explain_verdict(evaluation: Dict[str, Any]) -> Dict[str, Any]:
             f"无法解释无效的评估结果：matched_rules 应为列表，实际为 {type(matched_rules).__name__}"
         )
     _MATCHED_RULE_FIELDS = ("id", "name", "level", "observed", "threshold", "unit", "description")
+    # P2-2（2026-08-18，十七审）：规则 ID 白名单——explain_verdict 是"判定链格式化器"，
+    # 此前接受任意外部 id（伪造判定链/虚构规则 ID 也能解释），医生复核被误导；仅允许
+    # 规则库真实存在的 id（防伪造）。加载失败（数据问题）由外层 fail-closed。
+    _known_rule_ids = {r["id"] for r in _load_rules()["rules"]}
     for i, m in enumerate(matched_rules):
         if not isinstance(m, dict):
             raise ValueError(f"matched_rules[{i}] 应为 dict，实际为 {type(m).__name__}")
+        if m.get("id") not in _known_rule_ids:
+            raise ValueError(
+                f"matched_rules[{i}].id={m.get('id')!r} 不在规则库中"
+                "（explain_verdict 拒绝解释伪造/未知规则）")
         missing = [f for f in _MATCHED_RULE_FIELDS if f not in m]
         if missing:
             raise ValueError(f"matched_rules[{i}] 缺少字段: {missing}")
@@ -1276,6 +1298,16 @@ def assess_clinical_status(
             raise ValueError(
                 f"dialysis_mode 必须是 none / hemodialysis / peritoneal 之一，收到："
                 f"{dialysis_mode!r}")
+
+    # P1-1（2026-08-18，十七审）：DAG 入口统一类型+有限性校验——此前 age_years/
+    # height_cm 在 method 自动推理 `is_preterm and age_years < 1` 处才参与比较，
+    # 绕过 server 直调 core 时字符串 "0.5" 直接 TypeError（非 INVALID_INPUT）；
+    # is_preterm 非 bool（"false" truthy）误判早产 k=0.33。入口归一化与 calc 层
+    # 幂等（calc_egfr_schwartz 内部同口径再校验）。
+    age_years = _require_finite(age_years, "age_years")
+    height_cm = _require_finite(height_cm, "height_cm")
+    if not isinstance(is_preterm, bool):
+        raise ValueError("is_preterm 必须为 bool（True/False）")
 
     # 2026-08-12（系统性审查，P1）：sex 入口统一清洗为 "male"/"female"/None——
     # 与 calc 内部归一化幂等，保证全链路口径一致（审计/日志/sex_note 单一事实源）。
@@ -1445,6 +1477,29 @@ def assess_clinical_status(
             risk_completeness["note"] += (
                 f"（注意：prior_labs 缺失 {missing_prior} 历史对照，对应动态趋势类规则"
                 "（R-01/R-07/R-08）未触发评估，overall_level 不含相关急性恶化判断。）")
+    # P1-3（2026-08-18，十七审）：未识别指标显式暴露——调用方传入但规则库不认识的
+    # 键（如 "potassium" 而非 "k"）此前静默忽略，调用方误以为已评估 → 危急规则漏检
+    # 无告警（fail-open）。uacr/upcr/bun 是 DAG 合法非规则指标，排除免误报。
+    _KNOWN_NON_RULE = {"uacr", "upcr", "bun"}
+    unknown_metrics = sorted(set(normalized_labs) - set(rule_metrics) - _KNOWN_NON_RULE)
+    risk_completeness["unknown_metrics"] = unknown_metrics
+    if unknown_metrics:
+        risk_completeness["note"] += (
+            f"（未识别指标 {unknown_metrics}：不在规则库依赖集内，对应规则不会触发；"
+            "请核对拼写——如钾应传 k 而非 potassium。）")
+    # P1-4（2026-08-18，十七审）：结构化机器可读覆盖度——此前仅 covered/missing +
+    # 中文 note（趋势缺失仅文字），下游无法程序化判断"是否全面评估"。拆分为
+    # metric_coverage（绝对规则指标）/ trend_coverage（趋势规则所需历史对照）/
+    # fully_evaluable（两者都齐才算全面）。旧键 covered_metrics/missing_metrics
+    # 保留兼容既有消费者。
+    risk_completeness["metric_coverage"] = {
+        "covered": sorted(covered_metrics), "missing": missing_metrics}
+    risk_completeness["trend_coverage"] = {
+        "required": sorted(required_prior) if trend_rules else [],
+        "covered": sorted(set(norm_prior or {}) & required_prior) if trend_rules else [],
+        "missing": missing_prior if trend_rules else []}
+    risk_completeness["fully_evaluable"] = bool(
+        not missing_metrics and (not trend_rules or not missing_prior))
     return {
         "ok": True,
         "data": {
@@ -1467,6 +1522,11 @@ def assess_clinical_status(
             "prior_comparison": risk_data.get("prior_comparison"),
             # BUG-26 修复：风险扫描覆盖完整性声明（防"未全面评估却显示无风险"的假象）
             "risk_completeness": risk_completeness,
+            # P2-4（2026-08-18，十七审）：返回归一化后的 dialysis_mode（审计用）——
+            # 内部 .strip().lower() 归一化，此前不返回标准值，调用方无法确知生效值
+            # （如传入 "HemoDialysis " 时返回的 stage 依据不明）。
+            "dialysis_mode_normalized": (dialysis_mode.strip().lower()
+                                         if dialysis_mode else None),
             # 2026-08-12：DAG 级警告（如 k_value 被忽略）
             "warnings": warnings,
         },
