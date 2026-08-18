@@ -80,9 +80,10 @@ def assess_clinical_status_tool(
     仅 method="classic" 时生效；不传或 method 非 classic 时不影响计算。
     is_preterm：<1y 早产儿在 method 未指定时自动采用经典式 k=0.33（防 eGFR 高估）。
 
-    UPCR 单位（M-5，2026-08-16）：upcr_mg_g（mg/g，KDIGO 阈值单位）与
-    upcr_mg_mmol（mg/mmol，P1 契约单位，自动 ÷8.84 换算）**二选一**——两者同时
-    传入即拒绝（差 8.84 倍，防单位歧义导致分期错误）。UACR 同单位 mg/g。
+    UPCR 单位（M-5，2026-08-16；2026-08-18 修正换算方向）：upcr_mg_g（mg/g，
+    KDIGO 阈值单位）与 upcr_mg_mmol（mg/mmol，P1 契约单位，自动 **×8.84** 换算为
+    mg/g）**二选一**——两者同时传入即拒绝（差 8.84 倍，防单位歧义导致分期错误）。
+    UACR 同单位 mg/g。
 
     new_labs（本轮新化验，可选）支持两种键名（**务必使用以下标准 Key，勿自定义
     如 creatinine/potassium 等名称**）：
@@ -90,7 +91,8 @@ def assess_clinical_status_tool(
       ua(umol/L), egfr(ml/min/1.73m²), bun(mg/dL), uacr(mg/g), upcr(mg/g)；
     - P1 完整键名（自动换算）：scr_umol_L(÷88.4), k_mmol_L, p_mmol_L, hb_g_L,
       ca_mmol_L, na_mmol_L, ua_umol_L, egfr_ml_min, bun_mmol_L(×2.8),
-      bun_mg_dl/bun_mg_dL, uacr_mg_g, upcr_mg_g（键名匹配不区分大小写）。
+      bun_mg_dl/bun_mg_dL, uacr_mg_g（若 P1 返回）, upcr_mg_mmol（×8.84 转 mg/g，
+      P1 UPCR 契约键）, upcr_mg_g（键名匹配不区分大小写）。
     规则引擎仅识别上述 Key；未识别的 Key 会被忽略导致对应规则静默跳过。
     prior_labs（上轮同指标历史值，可选）键名同 new_labs，用于动态趋势类规则
     （scr/egfr 环比），缺失则趋势规则不触发。

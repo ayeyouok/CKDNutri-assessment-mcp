@@ -94,10 +94,33 @@ def _egfr_to_g(egfr: float, dialysis_mode: Optional[str] = None) -> str:
 
 
 def _acr_to_a(uacr_mg_g: float) -> str:
-    """白蛋白尿 A 期：UACR mg/g。"""
+    """白蛋白尿 A 期：UACR mg/g（KDIGO 2024 阈值 30/300）。"""
     if uacr_mg_g < 30:
         return "A1"
     if uacr_mg_g <= 300:
+        return "A2"
+    return "A3"
+
+
+# UPCR（尿蛋白/肌酐比）儿科分级界限（mg/g）——按 KDIGO 蛋白尿 P1/P2/P3 分级，
+# 儿科临床 A1 界限取 200 mg/g（高于通用 150，见审查报告2 用户指示）：
+#   A1 < 200（通用 <150） | A2 200–500 | A3 > 500
+# 注：KDIGO 正式将白蛋白尿(A=白蛋白)与蛋白尿(P=总蛋白)分列；本系统按产品/临床约定
+# 把 UPCR 蛋白尿分级交叉映射为合并分期所用的 A 记号（GxAx），避免仅提供 UPCR 时
+# 完全无 A 分期（此前 a=None 迫使 LLM/编排层自行套 UACR 30/300 表误判，见审查报告2）。
+_UPCR_A1_BOUND_MG_G = 200.0
+_UPCR_A3_BOUND_MG_G = 500.0
+
+
+def _pcr_to_a(upcr_mg_g: float) -> str:
+    """UPCR（尿总蛋白/肌酐比，mg/g）→ A 期（KDIGO 蛋白尿分级，儿科口径）。
+
+    UPCR 与 UACR 不等价（UPCR 含球蛋白），但 UPCR 是更常用的筛查指标，KDIGO 提供
+    蛋白尿 P1/P2/P3 分级（<200 / 200–500 / >500 mg/g，儿科），此处按产品约定映射。
+    """
+    if upcr_mg_g < _UPCR_A1_BOUND_MG_G:
+        return "A1"
+    if upcr_mg_g <= _UPCR_A3_BOUND_MG_G:
         return "A2"
     return "A3"
 
@@ -331,6 +354,10 @@ def _require_finite(value: Any, name: str) -> float:
     原因：NaN 静默穿透所有比较（nan<0=False 绕过负数校验、_egfr_to_g(nan) 落 G5），
     inf 恒真落 G1——数值异常必须显式报错，不得静默误分期（临床安全）。
     """
+    # 2026-08-18（审查报告2 P2）：显式拒绝布尔——bool 是 int 子类，float(True)=1.0
+    # 会命中数值规则（如 {"k":True}→1.0 触发 R-11 危急值），属类型误用，fail-closed。
+    if isinstance(value, bool):
+        raise ValueError(f"{name} 必须为有效数值（不支持布尔值）")
     try:
         v = float(value)
     except (TypeError, ValueError):
@@ -356,14 +383,13 @@ def classify_ckd(
     G5D（KDIGO 2024 / PRNT 2025），与 G5 区分（随访频率不同：G5D 每月 vs G5 每 60 天）。
     合法值：none / hemodialysis / peritoneal（透传 classify 后的 G5D 供 care 层消费）。
 
-    M-5（2026-08-16，十一审）：**UPCR 单位防呆**——P1 契约 upcr_mg_mmol（mg/mmol）
-    与 KDIGO UPCR 阈值单位（mg/g）差 **8.84 倍**，此前仅收 upcr_mg_g，编排层误传
-    P1 值即静默错 8.84 倍。现支持 upcr_mg_mmol（自动 ÷8.84 换算为 mg/g 后参与）：
+    M-5（2026-08-16，十一审；2026-08-18 修正换算方向）：**UPCR 单位防呆**——P1 契约
+    upcr_mg_mmol（mg/mmol）与 KDIGO UPCR 阈值单位（mg/g）差 **8.84 倍**，此前仅收
+    upcr_mg_g，编排层误传 P1 值即静默错 8.84 倍。换算方向：1 mg/mmol = 8.84 mg/g，
+    故 mg/mmol → mg/g 须 **乘以 8.84**（原 M-5 注释写对、代码写反 `÷8.84`，已修正）。
     - 仅传 upcr_mg_g：按原口径（KDIGO mg/g）；
-    - 仅传 upcr_mg_mmol：÷8.84 换算并标注来源；
+    - 仅传 upcr_mg_mmol：×8.84 换算为 mg/g 后参与；
     - **同时传两单位：拒绝**（单位歧义，防静默错 8.84 倍）。
-    换算系数 8.84（肌酐 mmol→mg 摩尔质量 113.12 mg/mmol ÷ 1000 × ... 即
-    1 mg/mmol = 8.84 mg/g，见 clinical-data reference.UNIT_ALIASES 同口径）。
 
     BUG-34：显式取 caller 并回写审计字段。
     """
@@ -398,7 +424,7 @@ def classify_ckd(
     albuminuria_source = ""
     albuminuria_note = None
     upcr_used = upcr_mg_g if upcr_mg_g is not None else (
-        (upcr_mg_mmol / 8.84) if upcr_mg_mmol is not None else None)
+        (upcr_mg_mmol * 8.84) if upcr_mg_mmol is not None else None)
     if uacr_mg_g is not None:
         a = _acr_to_a(uacr_mg_g)
         albuminuria_source = "UACR"
@@ -409,15 +435,18 @@ def classify_ckd(
             albuminuria_note = ("同时提供 UACR 与 UPCR：按 KDIGO 2024 以 UACR 为准，"
                                 "UPCR 未用于 A 分期。")
     elif upcr_used is not None:
-        # BUG-48（2026-08-12）：KDIGO 2024 白蛋白尿 A 分期**仅基于 UACR**。UPCR 反映尿总蛋白
-        # （含球蛋白），与白蛋白不等价——肾病综合征等患儿 UPCR 显著高于 UACR，直接映射
-        # 会把 A1 误判为 A2/A3。故仅提供 UPCR 时**不再映射 A 分期**（a=None），
-        # 返回明确提示，请补充 UACR 后再做白蛋白尿分期。
-        a = None
+        # 2026-08-18（审查报告2）：仅提供 UPCR 时按 KDIGO 蛋白尿分级（儿科口径）映射 A 期。
+        # 原 BUG-48 设计（a=None + 提示补充 UACR）会导致仅持有 UPCR 的患儿完全无 A 分期，
+        # 迫使 LLM/编排层自行套 UACR 30/300 表误判（如 UPCR 122 mg/g 被错判 A2，应为 A1）。
+        # UPCR 与 UACR 不等价，但 KDIGO 提供蛋白尿 P1/P2/P3 分级，按产品/临床约定交叉映射
+        # 为 A 记号（GxAx），并保留提示：补充 UACR 可进一步精确分期。
+        a = _pcr_to_a(upcr_used)
         albuminuria_source = "UPCR"
-        albuminuria_note = ("仅提供 UPCR（尿总蛋白/肌酐比）：KDIGO 2024 白蛋白尿 A 分期仅基于 "
-                            "UACR，UPCR 含球蛋白排泄、与白蛋白不等价，未映射 A1/A2/A3。"
-                            "请补充 UACR 以完成分期。")
+        albuminuria_note = (
+            f"仅提供 UPCR（尿总蛋白/肌酐比，{upcr_used:.1f} mg/g）：按 KDIGO 蛋白尿分级"
+            f"（儿科口径 A1<{_UPCR_A1_BOUND_MG_G:g}/A2 200–500/A3>"
+            f"{_UPCR_A3_BOUND_MG_G:g} mg/g）映射 A 期；UPCR 含球蛋白排泄、与白蛋白不等价，"
+            f"补充 UACR 可进一步精确分期。")
 
     stage = f"{g}{a}" if a else g
 
@@ -429,7 +458,7 @@ def classify_ckd(
         "G4": "eGFR 15–29，重度下降",
         "G5": "eGFR < 15，肾衰竭",
         # S1 修复（2026-08-13）：透析患儿单独列 G5D——随访频率与 G5 不同
-        "G5D": "eGFR < 15 且正在透析（G5D）",
+        "G5D": "正在透析（G5D，KDIGO 2024：透析状态独立于 eGFR 定义，随访每月）",
     }[g]
     a_desc = None
     if a is not None:
@@ -458,38 +487,43 @@ def classify_ckd(
             "albuminuria_note": albuminuria_note,
             # 2026-08-12（系统性审查，P3）：双指标同时传入时为 True——机器可读标注
             # UPCR 被忽略（与 albuminuria_note 文本互补，供上游审计程序化判断）。
-            "upcr_ignored": (uacr_mg_g is not None and upcr_mg_g is not None),
+            "upcr_ignored": (uacr_mg_g is not None
+                             and (upcr_mg_g is not None or upcr_mg_mmol is not None)),
             "risk_note": risk_note,
         },
     }
 
 
 def _risk_note(g: str, a: Optional[str]) -> str:
-    """按 G/A 给出进展风险与随访强度提示（信息性）。"""
-    # S1 修复（2026-08-13）：G5D 与 G5 同属最高风险档（rank=5）
-    g_rank = {"G1": 0, "G2": 1, "G3a": 2, "G3b": 3, "G4": 4, "G5": 5, "G5D": 5}[g]
-    a_rank = {"A1": 0, "A2": 1, "A3": 2}.get(a or "A1", 0)
-    # F2（2026-08-17，十二审）：**G 阶段地板**——KDIGO 2024 风险热图把 G4/G5/G5D
-    # 定义为高进展风险（红色区），**与白蛋白尿无关**（G4/G5 无论 A1/A2/A3 都是高
-    # 风险）。此前纯加性评分 g_rank+a_rank 阈值 ≥6 高：G4 A1=4、G5 A1=5、G5D A1=5
-    # 全落"中等"（3-6 月随访）→ 透析/晚期患儿被建议 3-6 月随访且风险文案降级，
-    # 临床分级不足。加地板：G4+ 直接判高（与 KDIGO 热图一致）。
-    if g in ("G4", "G5", "G5D"):
-        note = "进展风险高：建议缩短随访间隔（如 1–3 个月）并由肾科密切管理。"
-    else:
-        score = g_rank + a_rank
-        if score >= 6:
-            note = "进展风险高：建议缩短随访间隔（如 1–3 个月）并由肾科密切管理。"
-        elif score >= 3:
-            note = "进展风险中等：建议 3–6 个月随访一次。"
-        else:
-            note = "进展风险低：建议 6–12 个月常规随访。"
-    # BUG-58（2026-08-12）：a=None（未提供 UACR / 仅提供 UPCR）时评分按无白蛋白尿计，
-    # 可能低估进展风险——显式注明白蛋白尿未计入，提示补充 UACR 复评（透明，不捏造分期）。
+    """按 KDIGO 2024 进展风险热图（G×A）给出风险档与随访强度提示（信息性）。
+
+    2026-08-18（审查报告2 P0-1 修正）：原加性评分 g_rank+a_rank 阈值 ≥6 判"高"，
+    但 G1–G3b 最大分 = 3+2 = 5 < 6，"高"分支对非 G4+ 患者**不可达**——G1A3/G2A3/
+    G3aA3/G3bA2/G3bA3 等高危格被错判为"中/低"，与 KDIGO 热图严重偏离。现改为直接查
+    KDIGO 2024 风险热图（G×A → 低/中/高），与指南严格对齐。
+    """
+    # KDIGO 2024 进展风险热图（KDIGO 2012/2024 Appendix 2），3 档对齐 risk_note 文案：
+    # 绿=低、黄=中、橙/红=高。G4/G5/G5D 无论白蛋白尿均为高（与原 F2 地板一致）。
+    # 注：G3aA1 按 canonical KDIGO 归"低"（绿区）；若产品/儿科口径将其列为"中"可调整下表。
+    _RISK_HEATMAP = {
+        ("G1", "A1"): "低", ("G1", "A2"): "中", ("G1", "A3"): "高",
+        ("G2", "A1"): "低", ("G2", "A2"): "中", ("G2", "A3"): "高",
+        ("G3a", "A1"): "低", ("G3a", "A2"): "中", ("G3a", "A3"): "高",
+        ("G3b", "A1"): "中", ("G3b", "A2"): "高", ("G3b", "A3"): "高",
+        ("G4", "A1"): "高", ("G4", "A2"): "高", ("G4", "A3"): "高",
+        ("G5", "A1"): "高", ("G5", "A2"): "高", ("G5", "A3"): "高",
+        ("G5D", "A1"): "高", ("G5D", "A2"): "高", ("G5D", "A3"): "高",
+    }
     if a is None:
-        note += ("（白蛋白尿 A 分期未计入评分：未提供 UACR 或仅提供 UPCR；"
-                 "实际进展风险可能更高，请补充 UACR 后复评。）")
-    return note
+        # 白蛋白尿未计入：无法按 KDIGO 热图评估，显式提示补充 UACR，绝不捏造低风险。
+        return ("白蛋白尿 A 分期未计入 KDIGO 风险热图（未提供 UACR / 仅提供 UPCR）；"
+                "实际进展风险可能更高，请补充 UACR 后复评。")
+    tier = _RISK_HEATMAP.get((g, a), "中")
+    if tier == "高":
+        return "进展风险高：建议缩短随访间隔（如 1–3 个月）并由肾科密切管理。"
+    if tier == "中":
+        return "进展风险中等：建议 3–6 个月随访一次。"
+    return "进展风险低：建议 6–12 个月常规随访。"
 
 _RULES_PATH = os.path.join(os.path.dirname(__file__), "data", "rules.json")
 _RULES: Optional[Dict[str, Any]] = None
@@ -602,12 +636,17 @@ def _validate_rules_schema(rules_doc: Dict[str, Any]) -> None:
             if op == "between":
                 low, high = r.get("low"), r.get("high")
                 if not (isinstance(low, (int, float)) and isinstance(high, (int, float))
-                        and low < high):
+                        and math.isfinite(low) and math.isfinite(high) and low < high):
                     raise RuntimeError(
-                        f"规则 {r['id']} between 需 low < high 数值，收到 low={low!r} high={high!r}")
-            elif not isinstance(r.get("threshold"), (int, float)):
-                raise RuntimeError(
-                    f"规则 {r['id']} 单边 operator 需数值 threshold，收到 {r.get('threshold')!r}")
+                        f"规则 {r['id']} between 需 low < high 有限数值，收到 low={low!r} high={high!r}")
+            else:
+                thr = r.get("threshold")
+                # 2026-08-18（审查报告2 P2）：单边阈值须为有限数值——json.load 接受
+                # NaN/Inf 字面量，isinstance 校验挡不住；NaN 阈值令 v>nan 恒 False，
+                # L1 危急规则被静默"死亡"（fail-open）。显式 isfinite 拦截。
+                if not isinstance(thr, (int, float)) or math.isnan(thr) or math.isinf(thr):
+                    raise RuntimeError(
+                        f"规则 {r['id']} 单边 operator 需有限数值 threshold，收到 {thr!r}")
         elif r["type"] == "trend_pct":
             direction = r.get("direction")
             if direction not in _VALID_TREND_DIRECTIONS:
@@ -625,13 +664,17 @@ def _validate_rules_schema(rules_doc: Dict[str, Any]) -> None:
             if has_range:
                 low_pct, high_pct = r.get("low_pct"), r.get("high_pct")
                 if not (isinstance(low_pct, (int, float)) and isinstance(high_pct, (int, float))
+                        and math.isfinite(low_pct) and math.isfinite(high_pct)
                         and low_pct < high_pct):
                     raise RuntimeError(
-                        f"规则 {r['id']} 区间型趋势需 low_pct < high_pct，收到 "
+                        f"规则 {r['id']} 区间型趋势需 low_pct < high_pct 有限数值，收到 "
                         f"low_pct={low_pct!r} high_pct={high_pct!r}")
-            elif not isinstance(r.get("threshold_pct"), (int, float)):
-                raise RuntimeError(
-                    f"规则 {r['id']} 单阈值趋势需数值 threshold_pct，收到 {r.get('threshold_pct')!r}")
+            else:
+                tpct = r.get("threshold_pct")
+                # 2026-08-18（审查报告2 P2）：单边阈值须为有限数值（同 absolute 单边）。
+                if not isinstance(tpct, (int, float)) or math.isnan(tpct) or math.isinf(tpct):
+                    raise RuntimeError(
+                        f"规则 {r['id']} 单阈值趋势需有限数值 threshold_pct，收到 {tpct!r}")
         else:
             raise RuntimeError(
                 f"规则 {r['id']} type={r['type']!r} 非法，必须是 absolute / trend_pct")
@@ -700,7 +743,10 @@ def _eval_rule(rule: Dict[str, Any], new_labs: Dict[str, float],
             "metric": metric,
             # 2026-08-12（系统性审查）：observed 统一 round 2 位——umol/L→mg/dL 换算
             # 可能产生长浮点（100/88.4=1.131221719...），直出审计/医生端展示体验差。
-            "observed": round(v, 2),
+            # 2026-08-18（审查报告2 P2）：observed 保留 3 位精度——round(v,2) 在阈值
+            # 边界邻域会误舍入（如 5.499→5.5 显示越出 [5.0,5.5)），审计端误导；3 位既
+            # 避免长浮点（1.131221719→1.131）又不在边界处跨档。判定始终用原始 v，不受影响。
+            "observed": round(v, 3),
             # 2026-08-12（系统性审查）：threshold 统一为 str——此前 between 返回
             # Tuple[low, high]（(1.0,2.0)）而单边/趋势返回 str（">= 1.5"/"up [30,50)%"），
             # 下游强类型解析器（TS/Pydantic DTO）反序列化会因类型漂移崩溃。
@@ -797,6 +843,10 @@ _LAB_ALIAS_TO_RULE: dict[str, tuple[str, float]] = {
     # 扩展 + 键名规范化一致性（与 scr/k 等同模式，系数 1.0）。
     "uacr_mg_g": ("uacr", 1.0),
     "upcr_mg_g": ("upcr", 1.0),
+    # 2026-08-18（审查报告2 P1）：补 P1 唯一 UPCR 契约键 upcr_mg_mmol——此前缺失，
+    # 编排层直传 P1 get_labs 的 upcr_mg_mmol 即静默丢失（蛋白尿数据不进规则引擎，
+    # DAG new_labs 路径亦无法从 norm_inputs 合并）。mg/mmol → mg/g 须 ×8.84（P0-2 修正）。
+    "upcr_mg_mmol": ("upcr", 8.84),
 }
 
 
@@ -838,20 +888,33 @@ def _normalize_labs(labs: Optional[Dict[str, float]]) -> Optional[Dict[str, floa
     # 无法识别 → scr/bun 相关规则静默跳过 → overall_level="none" 假无风险。现用 lower_map
     # 归一化查找（短名仍精确匹配原样保留，不受影响）。
     lower_map = {k.lower(): k for k in out}
+    # 2026-08-18（审查报告2 P1）：单位冲突 fail-closed——同一 canonical short 的多个
+    # 来源键（如 scr_umol_L 与 scr_mg_dl 差 88.4×）值不一致时**拒绝**（此前静默取先者，
+    # 88.4× 冲突被吞，与 classify_ckd 双单位 UPCR 拒绝口径一致）。
+    alias_norm: Dict[str, float] = {}
     for full_key, (short, factor) in _LAB_ALIAS_TO_RULE.items():
         matched_key = lower_map.get(full_key.lower())
-        if matched_key is not None and short not in out:
-            # 完整键名已由 _require_finite 校验为有限数，换算必然成功（原 try/except
-            # 静默跳过改为强校验后不再需要——脏值在上一循环已被拦截）
-            out[short] = round(out[matched_key] * factor, 4)
-    # A-B5 修复（2026-08-14）：**短名键也大小写容错**——docstring 声称"键名匹配不区分
-    # 大小写"，但此前只对完整键名做 lower 映射，短名（scr/k/hb）大写传入（如 "HB"）→
-    # 规则静默跳过 → overall_level="none" 假象。合法短名集合 lower 后归一化到规范短名。
+        if matched_key is None:
+            continue
+        norm = round(out[matched_key] * factor, 4)
+        if short in alias_norm and abs(alias_norm[short] - norm) > 1e-6:
+            raise ValueError(
+                f"指标 {short!r} 单位冲突：检测到两种单位取值不一致"
+                f"（{matched_key}={norm} 与既有 {short}={alias_norm[short]}），"
+                f"请只传一种单位的 {short}。")
+        alias_norm[short] = norm
+        if short not in out:
+            out[short] = norm
+    # A-B5 修复（2026-08-14）：**短名键也大小写容错**；若与上面归一化值冲突则报错。
     _short_set = {short for _, (short, _f) in _LAB_ALIAS_TO_RULE.items()}
     for key in list(out.keys()):
         lk = key.lower()
         if lk in _short_set and lk != key:
-            out[lk] = out.pop(key)
+            val = out.pop(key)
+            if lk in out and abs(out[lk] - val) > 1e-6:
+                raise ValueError(
+                    f"指标 {lk!r} 存在大小写键冲突：{key}={val} 与 {lk}={out[lk]} 不一致")
+            out[lk] = val
     return out
 
 
@@ -929,6 +992,10 @@ def evaluate_risk_rules(
         # 强制校验合法枚举 {"L1","L2","L3","none"}，非法值忽略对比（不误导）。
         if prior_level not in _LEVEL_RANK:
             delta_note = f"历史等级 {prior_level!r} 无效，已忽略对比"
+        elif prior_level == "none":
+            # 2026-08-18（审查报告2 P2）：none 为"无历史"哨兵，不应读作"历史等级 none
+            # 再升高"（易误判恶化），明确标注首次评估。
+            delta_note = "无历史等级对照（首次评估）"
         elif prior_level == overall:
             delta_note = f"与历史等级 {prior_level} 持平"
         elif _LEVEL_RANK[overall] > _LEVEL_RANK.get(prior_level, 0):
@@ -1001,8 +1068,11 @@ def explain_verdict(evaluation: Dict[str, Any]) -> Dict[str, Any]:
     # 信封模式（含 data 键）：data 必须为 dict——{ok:true, data:null} 属于异常信封，
     # 显式报错而非静默当"无规则命中"（fail-closed，与 BUG-58 原则一致）。
     # 裸 data 模式（无 data 键）：evaluation 即业务体（向后兼容）。
-    if "data" in evaluation:
-        data = evaluation["data"]
+    if "ok" in evaluation:
+        # 信封模式：成功信封必须含 dict 类型的 data（与 BUG-58 fail-closed 一致）。
+        # {ok:true} 缺 data 与 {ok:true, data:null} 同属异常信封，均显式报错，
+        # 不再静默当"无规则命中"（修复审查报告2 P2 信封校验不对称）。
+        data = evaluation.get("data")
         if not isinstance(data, dict):
             raise ValueError(
                 f"无法解释无效的评估结果：{evaluation.get('ok')} 信封的 data 应为 dict，"
