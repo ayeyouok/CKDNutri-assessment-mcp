@@ -11,6 +11,7 @@ import 到 assessment 而通过，但 GitHub Actions CI 只安装本包，nutrit
 from __future__ import annotations
 
 import os
+
 os.environ.setdefault("A207_ENV", "test")  # N-SEC-1（2026-08-14）：测试进程显式声明测试环境（守卫 fail-closed 默认拒绝）
 os.environ.setdefault("A207_ACCEPT_DEV_STORAGE", "1")  # 生产护栏（2026-08-15）：测试进程显式确认 json 后端为开发模式
 import sys
@@ -110,8 +111,9 @@ def test_egfr_golden_invalid_inputs():
 
     for bad in (-5, float("nan"), float("inf")):
         for fn in (
-            lambda: core.calc_egfr_schwartz(age_years=6, height_cm=115, serum_creatinine_mgdl=bad),
-            lambda: core.classify_ckd(egfr=bad),
+            # B023：默认参数绑定循环变量（lambda 闭包不捕获循环变量）
+            lambda b=bad: core.calc_egfr_schwartz(age_years=6, height_cm=115, serum_creatinine_mgdl=b),
+            lambda b=bad: core.classify_ckd(egfr=b),
         ):
             try:
                 fn()

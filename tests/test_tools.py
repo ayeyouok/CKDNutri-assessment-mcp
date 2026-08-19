@@ -13,6 +13,7 @@ CI 也难以统一调用。本文件把 smoke 全部用例聚合为一个可 imp
 from __future__ import annotations
 
 import os
+
 os.environ.setdefault("A207_ENV", "test")  # N-SEC-1（2026-08-14）：测试进程显式声明测试环境（守卫 fail-closed 默认拒绝）
 os.environ.setdefault("A207_ACCEPT_DEV_STORAGE", "1")  # 生产护栏（2026-08-15）：测试进程显式确认 json 后端为开发模式
 import sys
@@ -30,7 +31,7 @@ def main() -> int:
         (name, fn) for name, fn in vars(_smoke).items()
         if name.startswith("test_") and callable(fn)
     )
-    for name, fn in fns:
+    for _name, fn in fns:
         fn()
     print(f"P4 TOOLS OK（{len(fns)} 个用例）")
     return 0

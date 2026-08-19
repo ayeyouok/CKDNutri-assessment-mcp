@@ -5,14 +5,11 @@ v2.3 新增 DAG: assess_clinical_status（eGFR→分期→风险 一键判定）
 """
 from __future__ import annotations
 
-import json
 import logging
-
-from typing import Any, Literal, Optional
-
-from fastmcp import FastMCP
+from typing import Any, Literal
 
 from a207_policy import translate_error
+from fastmcp import FastMCP
 
 from .core import (
     assess_clinical_status,
@@ -56,17 +53,17 @@ def assess_clinical_status_tool(
     serum_creatinine_mgdl: float,
     serum_creatinine_unit: Literal["mg_dL", "umol_L"] = "mg_dL",
     is_preterm: bool = False,
-    sex: Optional[Literal["M", "F"]] = None,
-    uacr_mg_g: Optional[float] = None,
-    upcr_mg_g: Optional[float] = None,
-    upcr_mg_mmol: Optional[float] = None,  # M-5（2026-08-16）：UPCR mg/mmol（P1 契约单位），自动 ×8.84 转 mg/g（P4 注释修正：mg/mmol→mg/g 是乘法，此前误写 ÷）
-    bun_mg_dl: Optional[float] = None,
-    k_value: Optional[float] = None,
-    method: Optional[Literal["bedside2009", "classic"]] = None,  # M-1：revised2009 假公式已移除（CKiD 组合式需胱抑素 C，未实现）
-    new_labs: Optional[dict[str, float]] = None,
-    prior_labs: Optional[dict[str, float]] = None,
-    prior_level: Optional[Literal["L1", "L2", "L3", "none"]] = None,
-    dialysis_mode: Optional[Literal["none", "hemodialysis", "peritoneal"]] = None,
+    sex: Literal["M", "F"] | None = None,
+    uacr_mg_g: float | None = None,
+    upcr_mg_g: float | None = None,
+    upcr_mg_mmol: float | None = None,  # M-5（2026-08-16）：UPCR mg/mmol（P1 契约单位），自动 ×8.84 转 mg/g（P4 注释修正：mg/mmol→mg/g 是乘法，此前误写 ÷）
+    bun_mg_dl: float | None = None,
+    k_value: float | None = None,
+    method: Literal["bedside2009", "classic"] | None = None,  # M-1：revised2009 假公式已移除（CKiD 组合式需胱抑素 C，未实现）
+    new_labs: dict[str, float] | None = None,
+    prior_labs: dict[str, float] | None = None,
+    prior_level: Literal["L1", "L2", "L3", "none"] | None = None,
+    dialysis_mode: Literal["none", "hemodialysis", "peritoneal"] | None = None,
 ) -> dict[str, Any]:
     """一键评估：eGFR→CKD 分期→风险等级 完整链路。
 

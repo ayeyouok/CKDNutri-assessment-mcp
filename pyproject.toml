@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "CKDNutri-assessment-mcp"
-version = "0.3.57"
+version = "0.3.58"
 description = "P4 评估计算域——eGFR+CKD分期+风险引擎（纯函数）"
 requires-python = ">=3.10"
 dependencies = [
@@ -33,3 +33,6 @@ exclude = ["build", "dist"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["E501"]  # 行超长不阻断（存量历史注释多），仅提示
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]  # 测试：sys.path/env 设置在 import 前（既有标准模式）

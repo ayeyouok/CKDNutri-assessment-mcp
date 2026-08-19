@@ -1,10 +1,10 @@
-# -*- coding: utf-8 -*-
 """十五审（2026-08-18）assessment-mcp 三审回归：P2×3 / P3×5 / P4 关键项。
 
 覆盖：大小写变体键冲突、短名-全键冲突、trend observed 3 位、浮点尘埃闭端、
 explain_verdict observed 有限性、私有函数直调防护、µ→u 键名归一、eGFR 消息精度。
 """
 import os
+
 os.environ.setdefault("A207_ENV", "test")
 os.environ.setdefault("A207_ACCEPT_DEV_STORAGE", "1")
 os.environ.setdefault("A207_CALLER", "doctor_assistant")
@@ -74,7 +74,6 @@ def test_p31_dust_boundary_hits_closed_edge():
 
 def test_p32_explain_verdict_nan_observed_rejected():
     """P3-2：explain_verdict observed=NaN 拒绝（此前只查字段存在不查有限）。"""
-    import math
 
     bad = {"matched_rules": [{
         "id": "R-01", "name": "x", "level": "L1", "observed": float("nan"),
@@ -97,7 +96,6 @@ def test_p32_explain_verdict_nan_observed_rejected():
 def test_p33_private_fn_direct_call_guards():
     """P3-3：私有函数直调防护（编排层可直接 import）——NaN/负/Inf 显式拒绝，
     不再静默误分期（_egfr_to_g(NaN)→G5、_egfr_to_g(Inf)→G1、_acr_to_a(-5)→A1）。"""
-    import math
 
     for fn, bad in ((core._egfr_to_g, float("nan")),
                     (core._egfr_to_g, float("inf")),
@@ -331,7 +329,6 @@ def test_p55_level_rank_strict():
 
 def test_p52_eval_rule_nan_guard():
     """P2-1：_eval_rule 直调 NaN 拒绝（此前 NaN 比较恒 False 静默漏检）。"""
-    import math
 
     from CKDNutri_assessment_mcp import core
 
