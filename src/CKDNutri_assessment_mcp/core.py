@@ -273,6 +273,13 @@ def calc_egfr_schwartz(
         k_value = _require_finite(k_value, "k_value")
         if k_value <= 0:
             raise ValueError("k_value 必须 > 0")
+    # 审查 P2-1（2026-08-19）：bedside2009 固定 k=0.413，k_value 不参与计算——
+    # 静默忽略会让调用方误以为 k_value 已生效（参数被接受但实际无效）。显式拒绝，
+    # 引导自定义 k 走 classic。
+    if method == "bedside2009" and k_value is not None:
+        raise ValueError(
+            "method='bedside2009' 固定 k=0.413，不支持 k_value；"
+            "如需自定义 k（如早产 0.33 / 年龄带覆盖），请使用 method='classic'")
 
     if method == "classic":
         k = _schwartz_k(age_years, k_value, is_preterm=is_preterm, sex=sex)
@@ -1014,6 +1021,15 @@ def _normalize_labs(labs: dict[str, float] | None) -> dict[str, float] | None:
         # k_mmol_L=5.50001 → 5.5 存储 → 规则 R-02（k>5.5）临界值漏检；换算与
         # 冲突检测统一 math.isclose（rel 1e-9 / abs 1e-6），仅展示层保留舍入。
         norm = out[matched_key] * factor
+        # 审查 P1-2（2026-08-19）：**换算后二次有限性检查**——输入本身有限但
+        # ×大因子（如 upcr_mg_mmol=1e308 × 8.84）可溢出为 inf；旧实现 inf 继续
+        # 参与规则比较（isclose 对 inf 语义异常、规则可误判）。fail-closed 链条：
+        # 原始值检查 → 单位换算 → **换算结果检查** → 进入规则计算。
+        if not math.isfinite(norm):
+            raise ValueError(
+                f"指标 {short!r} 单位换算后超出有限数值范围"
+                f"（{matched_key}={out[matched_key]} × {factor} → {norm}），"
+                "拒绝参与规则计算")
         if short in alias_norm and not math.isclose(alias_norm[short], norm,
                                                     rel_tol=1e-9, abs_tol=1e-6):
             raise ValueError(
@@ -1233,11 +1249,15 @@ def explain_verdict(evaluation: dict[str, Any]) -> dict[str, Any]:
     # P2-2（2026-08-18，十七审）：规则 ID 白名单——explain_verdict 是"判定链格式化器"，
     # 此前接受任意外部 id（伪造判定链/虚构规则 ID 也能解释），医生复核被误导；仅允许
     # 规则库真实存在的 id（防伪造）。加载失败（数据问题）由外层 fail-closed。
-    _known_rule_ids = {r["id"] for r in _load_rules()["rules"]}
+    # 审查 P1-1（2026-08-19）：**审计信息不可伪造**——id 校验只是第一层：此前
+    # name/level/threshold/unit/description 仍取调用方传入值，"真实 rule_id + 伪造
+    # metadata"可生成看似合法的审计解释。现全部改为**服务端按 rule_id 从规则库
+    # 重新生成**（调用方仅提供 id + observed 实测值），伪造内容被忽略。
+    _rule_by_id = {r["id"]: r for r in _load_rules()["rules"]}
     for i, m in enumerate(matched_rules):
         if not isinstance(m, dict):
             raise ValueError(f"matched_rules[{i}] 应为 dict，实际为 {type(m).__name__}")
-        if m.get("id") not in _known_rule_ids:
+        if m.get("id") not in _rule_by_id:
             raise ValueError(
                 f"matched_rules[{i}].id={m.get('id')!r} 不在规则库中"
                 "（explain_verdict 拒绝解释伪造/未知规则）")
@@ -1252,14 +1272,17 @@ def explain_verdict(evaluation: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 f"matched_rules[{i}].observed 必须为有限数值（收到 {m['observed']!r}）")
     for m in matched_rules:
+        # 审查 P1-1：规则元数据全部取规则库真实值（调用方提供的 name/level/threshold/
+        # unit/description 不参与审计链，杜绝伪造）；observed 是实测值保留展示。
+        real = _rule_by_id[m["id"]]
         chain.append({
             "rule_id": m["id"],
-            "rule_name": m["name"],
-            "level": m["level"],
+            "rule_name": real["name"],
+            "level": real["level"],
             "observed": m["observed"],
-            "threshold": m["threshold"],
-            "unit": m["unit"],
-            "why": m["description"],
+            "threshold": real.get("threshold", real.get("threshold_pct")),
+            "unit": real.get("unit"),
+            "why": real["description"],
         })
     if not chain:
         chain.append({"rule_id": "-", "rule_name": "无规则命中",
