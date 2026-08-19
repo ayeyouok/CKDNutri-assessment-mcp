@@ -6,6 +6,9 @@
 - P2-1：UPCR 双单位形参 canonicalize（同值合并放行 / 异值拒绝）
 - P1-2：fully_evaluable 含 unknown_metrics 条件
 - P1-3：assessment_status=FULL/PARTIAL 单字段
+
+运行：pytest tests/test_regression_as3.py（或 python tests/test_regression_as3.py 直接运行，
+CI 的 publish workflow 逐文件 `python tests/test_*.py`，**不安装 pytest**——本文件不依赖 pytest）。
 """
 import os
 
@@ -21,9 +24,26 @@ for p in (_SRC, _POLICY):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-import pytest  # noqa: E402
-
 from CKDNutri_assessment_mcp import core  # noqa: E402
+
+
+def _expect_raises(exc_type, fn, *args, **kwargs):
+    """断言 fn(*args, **kwargs) 抛 exc_type——不依赖 pytest（CI 直接运行模式）。"""
+    try:
+        fn(*args, **kwargs)
+    except exc_type as exc:
+        return exc
+    raise AssertionError(f"expected {exc_type.__name__} to be raised, got success")
+
+
+def _run_all() -> None:
+    """直接运行模式：执行本文件全部 test_* 函数（CI 的 `python tests/test_*.py`）。"""
+    import sys as _sys
+
+    for _name, _fn in sorted(vars(_sys.modules[__name__]).items()):
+        if _name.startswith("test_") and callable(_fn):
+            _fn()
+    print("P4 AS3 REGRESSION OK")
 
 
 def _classify(uacr=None, upcr=None, upcr_mmol=None, egfr=82.6):
@@ -68,16 +88,15 @@ def test_p21_upcr_dual_unit_equivalent_merged():
     assert r["ok"] is True, r
     assert r["data"]["ckd_a_stage"] == "A3"  # 884 mg/g > 500 → A3
     # 直接 classify_ckd 双单位仍拒绝（直调防御不变）
-    with pytest.raises(ValueError):
-        core.classify_ckd(egfr=82.6, upcr_mg_g=884.0, upcr_mg_mmol=100.0)
+    _expect_raises(ValueError, lambda: core.classify_ckd(
+        egfr=82.6, upcr_mg_g=884.0, upcr_mg_mmol=100.0))
 
 
 def test_p21_upcr_dual_unit_conflict_rejected():
     """P2-1：UPCR 双单位形参数值异值显式拒绝（数据冲突，fail-closed）。"""
-    with pytest.raises(ValueError):
-        core.assess_clinical_status(
-            age_years=6, height_cm=120, serum_creatinine_mgdl=0.6,
-            upcr_mg_g=100.0, upcr_mg_mmol=100.0)  # 100 mg/g != 884 mg/g
+    _expect_raises(ValueError, lambda: core.assess_clinical_status(
+        age_years=6, height_cm=120, serum_creatinine_mgdl=0.6,
+        upcr_mg_g=100.0, upcr_mg_mmol=100.0))  # 100 mg/g != 884 mg/g
 
 
 def test_p12_fully_evaluable_includes_unknown_metrics():
@@ -103,3 +122,7 @@ def test_p13_assessment_status_full():
     assert d["risk_completeness"]["missing_metrics"] == [], d["risk_completeness"]
     assert d["risk_completeness"]["fully_evaluable"] is True
     assert d["assessment_status"] == "FULL", d
+
+
+if __name__ == "__main__":
+    _run_all()
