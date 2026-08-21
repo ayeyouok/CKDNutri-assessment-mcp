@@ -49,7 +49,10 @@ _VALID_RULE_LEVELS = frozenset({"L1", "L2", "L3"})
 _VALID_ABS_OPS = frozenset({"gt", "gte", "lt", "lte", "between"})
 _VALID_TREND_DIRECTIONS = frozenset({"up", "down"})
 _RULE_REQUIRED_KEYS = ("id", "name", "level", "type", "metric", "unit", "description")
-_LEVEL_RANK = {"L1": 3, "L2": 2, "L3": 1, "none": 0}
+# 2026-08-21：风险等级严重度排序唯一事实源上移至 a207_policy.levels.RISK_LEVEL_RANK
+# （care 的 risk_escalation 方向校验也依赖它，此前两包各自定义会漂移）；本包沿用
+# 别名，既有调用与测试（test_regression_as2.py P1-5）行为不变。
+from a207_policy import RISK_LEVEL_RANK as _LEVEL_RANK
 
 
 def _egfr_to_g(egfr: float, dialysis_mode: str | None = None) -> str:
