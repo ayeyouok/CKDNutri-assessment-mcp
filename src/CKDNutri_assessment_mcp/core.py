@@ -234,6 +234,16 @@ def calc_egfr_schwartz(
         raise ValueError(
             f"sex={_sex_raw!r} 无法识别（≥13 岁 classic 式 k 值依赖性别，男性 0.70/"
             f"女性 0.55）：请传 M/F/male/female/男/女，禁止静默默认男性")
+    # 十六审（2026-08-24，#5）：classic 式 ≥13 岁且未显式传 k_value 时，若性别
+    # 根本未提供（sex=None），静默按男性 k=0.70 会令女性患儿 eGFR 系统性高估 27%
+    # （G3 误判 G2 / G4 误判 G3b）。显式 fail-closed：缺性别即拒绝，强制调用方明示。
+    if (method == "classic" and k_value is None and sex is None
+            and age_years is not None and not isinstance(age_years, bool)
+            and isinstance(age_years, (int, float)) and age_years >= 13):
+        raise ValueError(
+            "≥13 岁 classic 式 k 值依赖性别（男性 0.70 / 女性 0.55），但 sex 未提供且未"
+            "显式传入 k_value：禁止静默默认男性 k=0.70（女性患儿 eGFR 将高估 27%）。"
+            "请传 sex=M/F/male/female/男/女 或显式 k_value")
     if method not in ("bedside2009", "classic"):
         # M-1（2026-08-15）：revised2009 已移除（无文献出处的自造线性式）
         if method == "revised2009":
@@ -571,12 +581,14 @@ def _risk_note(g: str, a: str | None) -> str:
     """
     # KDIGO 2024 进展风险热图（KDIGO 2012/2024 Appendix 2），3 档对齐 risk_note 文案：
     # 绿=低、黄=中、橙/红=高。G4/G5/G5D 无论白蛋白尿均为高（与原 F2 地板一致）。
-    # 注：G3aA1 按 canonical KDIGO 归"低"（绿区）；若产品/儿科口径将其列为"中"可调整下表。
+    # 十六审（2026-08-24）：修正 G3aA1 / G3bA1 分级，对齐 KDIGO 2012 官方风险热图
+    # （Suppl Fig S1）：G3aA1 = 中度风险（黄）、G3bA1 = 高风险（橙）；原代码误归
+    # G3aA1="低"/G3bA1="中"，会错误拉长 G3a 患儿随访间隔（临床正确性缺陷）。
     _RISK_HEATMAP = {
         ("G1", "A1"): "低", ("G1", "A2"): "中", ("G1", "A3"): "高",
         ("G2", "A1"): "低", ("G2", "A2"): "中", ("G2", "A3"): "高",
-        ("G3a", "A1"): "低", ("G3a", "A2"): "中", ("G3a", "A3"): "高",
-        ("G3b", "A1"): "中", ("G3b", "A2"): "高", ("G3b", "A3"): "高",
+        ("G3a", "A1"): "中", ("G3a", "A2"): "中", ("G3a", "A3"): "高",
+        ("G3b", "A1"): "高", ("G3b", "A2"): "高", ("G3b", "A3"): "高",
         ("G4", "A1"): "高", ("G4", "A2"): "高", ("G4", "A3"): "高",
         ("G5", "A1"): "高", ("G5", "A2"): "高", ("G5", "A3"): "高",
         ("G5D", "A1"): "高", ("G5D", "A2"): "高", ("G5D", "A3"): "高",
@@ -1167,6 +1179,34 @@ def evaluate_risk_rules(
     }
 
 
+def _format_rule_threshold(rule: dict[str, Any]) -> str:
+    """统一生成规则阈值可读文本（供 list_rules / explain_verdict 复用，单一事实源）。
+
+    十六审（2026-08-24）：此前 explain_verdict 用 `real.get("threshold", real.get("threshold_pct"))`
+    对 between 规则（仅 low/high）与区间趋势规则（low_pct/high_pct）恒取 None、单阈值趋势
+    丢失 direction——审计链阈值缺失。本函数与 _eval_rule 的阈值展示口径严格对齐：
+      - absolute + between   → "[low, high)"
+      - absolute + 单边       → "{op_label} {threshold}"（gt/gte/lt/lte → >/>=/</<=）
+      - trend_pct + 区间型    → "{direction} [low_pct%, high_pct%)"
+      - trend_pct + 单阈值    → "{direction} >= {threshold_pct}%" / "down <= -{threshold_pct}%"
+    """
+    rtype = rule.get("type")
+    if rtype == "absolute":
+        op = rule.get("operator")
+        if op == "between":
+            return f"[{float(rule['low'])}, {float(rule['high'])})"
+        op_label = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}.get(op, op)
+        return f"{op_label} {rule.get('threshold')}"
+    if rtype == "trend_pct":
+        direction = rule.get("direction", "")
+        if "low_pct" in rule:
+            return f"{direction} [{rule['low_pct']}%, {rule['high_pct']}%)"
+        return (f"{direction} >= {rule.get('threshold_pct')}%"
+                if direction == "up"
+                else f"{direction} <= -{rule.get('threshold_pct')}%")
+    return ""
+
+
 def list_rules() -> dict[str, Any]:
     """返回规则清单（不含评估逻辑）。
 
@@ -1180,18 +1220,9 @@ def list_rules() -> dict[str, Any]:
     for r in rules_doc["rules"]:
         entry = {"id": r["id"], "name": r["name"], "level": r["level"],
                  "type": r["type"], "description": r["description"], "unit": r["unit"]}
-        if r["type"] == "absolute":
-            entry["criterion"] = (f"{r['operator']} {r.get('threshold')}"
-                                  if r["operator"] != "between"
-                                  # 2026-08-12（系统性审查，P2）：float() 幂等防御——
-                                  # _load_rules 加载时已归一化，此处与 _eval_rule 同口径
-                                  else f"[{float(r['low'])}, {float(r['high'])})")
-        else:
-            # 2026-08-13（二审 #8）：单阈值趋势补 ">= " 前缀——与 _eval_rule 的
-            # threshold 展示（">= 50"）一致；此前输出 "up 50%" 缺比较符，语义模糊。
-            entry["criterion"] = (f"{r['direction']} >= {r['threshold_pct']}%"
-                                  if "low_pct" not in r
-                                  else f"{r['direction']} [{r['low_pct']}, {r['high_pct']})%")
+        # 十六审（2026-08-24）：统一调用 _format_rule_threshold，消除 list_rules 与
+        # _eval_rule / explain_verdict 的阈值文案漂移（单一事实源）。
+        entry["criterion"] = _format_rule_threshold(r)
         out.append(entry)
     return {"ok": True, "data": {"rules": out}}
 
@@ -1283,7 +1314,7 @@ def explain_verdict(evaluation: dict[str, Any]) -> dict[str, Any]:
             "rule_name": real["name"],
             "level": real["level"],
             "observed": m["observed"],
-            "threshold": real.get("threshold", real.get("threshold_pct")),
+            "threshold": _format_rule_threshold(real),
             "unit": real.get("unit"),
             "why": real["description"],
         })

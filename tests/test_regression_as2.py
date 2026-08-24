@@ -227,20 +227,29 @@ def test_p46_is_preterm_bool_guard():
 
 
 def test_p47_unknown_sex_over13_rejected():
-    """P1-7（四审）：≥13 岁 classic 未知性别拒绝（此前静默按男性 k=0.70）。"""
+    """P1-7（四审）+ #5（十六审）：≥13 岁 classic 未知性别（含未提供 sex=None）拒绝。
+
+    此前 sex=None 静默按男性 k=0.70，女性患儿 eGFR 系统性高估 27%。
+    十六审 #5 将 sex=None 也纳入 fail-closed（显式 k_value 除外）。
+    """
     from CKDNutri_assessment_mcp import core
 
+    # 无法识别的字符串性别 → 拒绝（P1-7 原有覆盖）
     try:
         core.calc_egfr_schwartz(age_years=14, height_cm=150,
                                 serum_creatinine_mgdl=1.0, sex="未知", method="classic")
     except ValueError:
         pass
     else:
-        raise AssertionError("≥13 岁未知性别未拒绝")
-    # sex=None（未提供）向后兼容放行
-    r = core.calc_egfr_schwartz(age_years=14, height_cm=150,
+        raise AssertionError("≥13 岁未知性别字符串未拒绝")
+    # 十六审 #5：sex=None（根本未提供）也应拒绝，防女性 eGFR 静默高估
+    try:
+        core.calc_egfr_schwartz(age_years=14, height_cm=150,
                                 serum_creatinine_mgdl=1.0, method="classic")
-    assert r["ok"] is True, r
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("≥13 岁 classic 未提供 sex 未拒绝（女性 eGFR 将静默高估 27%）")
 
 
 # ---- 十七审（2026-08-18）：纯函数直调防御 + 语义加固（P1-1~P1-5 / P2-1/2/4）----
