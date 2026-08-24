@@ -1191,7 +1191,7 @@ def _format_rule_threshold(rule: dict[str, Any]) -> str:
       - absolute + between   → "[low, high)"
       - absolute + 单边       → "{op_label} {threshold}"（gt/gte/lt/lte → >/>=/</<=）
       - trend_pct + 区间型    → "{direction} [low_pct%, high_pct%)"
-      - trend_pct + 单阈值    → "{direction} >= {threshold_pct}%" / "down <= -{threshold_pct}%"
+      - trend_pct + 单阈值    → "{direction} >= {threshold_pct}%"（up/down 对称，如 "up >= 50%" / "down >= 25%"）
     """
     rtype = rule.get("type")
     if rtype == "absolute":
@@ -1204,10 +1204,10 @@ def _format_rule_threshold(rule: dict[str, Any]) -> str:
         direction = rule.get("direction", "")
         if "low_pct" in rule:
             return f"{direction} [{rule['low_pct']}%, {rule['high_pct']}%)"
-        return (f"{direction} >= {rule.get('threshold_pct')}%"
-                if direction == "up"
-                else f"{direction} <= -{rule.get('threshold_pct')}%")
-    return ""
+        # 十八审（2026-08-24，A7）：统一 "direction >= X%"——down 不再写成
+        # "down <= -X%"（三重否定语病：下降<=负值）；up/down 语义对称
+        # （如 "up >= 50%" / "down >= 25%" 表达"上升/下降幅度 ≥ X%"）。
+        return f"{direction} >= {rule.get('threshold_pct')}%"
 
 
 def list_rules() -> dict[str, Any]:
@@ -1438,10 +1438,25 @@ def assess_clinical_status(
     # 自动识别 Schwartz 方法（显式传入优先）
     warnings: list[str] = []
     if method is None:
-        # M-1（2026-08-15）：提供 BUN 不再自动默认 revised2009（假公式已移除）——
-        # 含 BUN 修订需胱抑素 C（CKiD 组合式）本系统未实现，BUN 不参与计算，降级床旁式
-        # 并显式告警（不静默吞参）。
-        if bun_mg_dl is not None:
+        # 十八审（2026-08-24，A6）：早产儿生理校正（k=0.33）优先级**高于**仅起提示作用的
+        # bun_mg_dl——BUN 已不参与任何 eGFR 算式（M-1），早产校正才是核心安全修正。
+        # 此前 `if bun_mg_dl is not None` 排在最前，带 BUN 的 <1y 早产患儿会被误判
+        # bedside2009（k=0.413），eGFR 系统性高估 ~25%（0.413/0.33），违背 BUG-47 防护初衷。
+        # 现先判早产，再判 BUN，确保早产 k=0.33 生效。
+        if is_preterm and age_years < 1:
+            # 2026-08-12（系统性审查，P1）：<1y 早产儿自动切经典式（k=0.33 生效），
+            # 与 BUG-47 口径一致。
+            method = "classic"
+            warnings.append("检测到早产（is_preterm=True 且 <1 岁）：自动采用经典式 "
+                            "k=0.33；如需床旁式请显式 method='bedside2009'。")
+            if bun_mg_dl is not None:
+                warnings.append("提供了 bun_mg_dl 但经典式未使用；BUN 不参与计算。")
+            if k_value is not None:
+                warnings.append("同时检测到早产与显式 k_value：已按 classic 式计算。")
+        elif bun_mg_dl is not None:
+            # M-1（2026-08-15）：提供 BUN 不再自动默认 revised2009（假公式已移除）——
+            # 含 BUN 修订需胱抑素 C（CKiD 组合式）本系统未实现，BUN 不参与计算，降级床旁式
+            # 并显式告警（不静默吞参）。
             method = "bedside2009"
             warnings.append(
                 "提供了 bun_mg_dl 但未指定 method：含 BUN 的修订需胱抑素 C（CKiD "
@@ -1453,14 +1468,6 @@ def assess_clinical_status(
                     "如需自定义 k 值请显式 method='classic' 并传 k_value。")
         elif k_value is not None:
             method = "classic"
-        elif is_preterm and age_years < 1:
-            # 2026-08-12（系统性审查，P1）：早产儿自动推理修正——此前 is_preterm=True
-            # 且无 bun/k_value 时落到 bedside2009（固定 k=0.413），早产 k=0.33 静默失效，
-            # eGFR 高估约 25%（0.413/0.33），G4 可能误判 G3，违背 BUG-47 防护初衷。
-            # <1y 早产儿自动切经典式（k=0.33 生效），与 BUG-47 口径一致。
-            method = "classic"
-            warnings.append("检测到早产（is_preterm=True 且 <1 岁）：自动采用经典式 "
-                            "k=0.33；如需床旁式请显式 method='bedside2009'。")
         else:
             method = "bedside2009"
 
@@ -1568,9 +1575,13 @@ def assess_clinical_status(
         norm_prior = norm_prior or {}  # 复用前移的归一化结果（评估与完整性校验共用）
         missing_prior = sorted(required_prior - set(norm_prior))
         if missing_prior:
+            # 十八审（2026-08-24，A9）：动态列出**实际受影响**的趋势规则——此前硬编码
+            # "（R-01/R-07/R-08）"，当仅缺 egfr（scr 已传、R-01 已评估）时仍误导称 R-01
+            # 未触发。按 missing_prior 指标精确反查 trend_rules 受影响者。
+            affected_rules = sorted([r["id"] for r in trend_rules if r["metric"] in missing_prior])
             risk_completeness["note"] += (
                 f"（注意：prior_labs 缺失 {missing_prior} 历史对照，对应动态趋势类规则"
-                "（R-01/R-07/R-08）未触发评估，overall_level 不含相关急性恶化判断。）")
+                f"（{'/'.join(affected_rules)}）未触发评估，overall_level 不含相关急性恶化判断。）")
     # P1-3（2026-08-18，十七审）：未识别指标显式暴露——调用方传入但规则库不认识的
     # 键（如 "potassium" 而非 "k"）此前静默忽略，调用方误以为已评估 → 危急规则漏检
     # 无告警（fail-open）。uacr/upcr/bun 是 DAG 合法非规则指标，排除免误报。
@@ -1634,6 +1645,10 @@ def assess_clinical_status(
                                          if dialysis_mode else None),
             # 2026-08-12：DAG 级警告（如 k_value 被忽略）
             "warnings": warnings,
+            # 十八审（2026-08-24，A8）：透出 calc_egfr_schwartz 的婴幼儿生理警示
+            # pediatric_caveat（<2y eGFR 可低至 60-90，G1/G2 需结合月龄解读），
+            # 此前 DAG 聚合层遗漏，医生调用主工具无法在顶层获取该关键警示。
+            "pediatric_caveat": egfr_r["data"].get("pediatric_caveat", ""),
         },
     }
 

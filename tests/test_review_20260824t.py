@@ -61,11 +61,11 @@ def test_explain_verdict_threshold_from_rule_library():
         "threshold": "?", "unit": "%", "description": "d"}]})
     assert r_up["data"]["chain"][0]["threshold"] == "up >= 50%", r_up
 
-    # 单阈值 down R-07（down <= -25%）
+    # 单阈值 down R-07（down >= 25%）
     r_down = core.explain_verdict({"matched_rules": [{
         "id": "R-07", "name": "x", "level": "L2", "observed": 30.0,
         "threshold": "?", "unit": "%", "description": "d"}]})
-    assert r_down["data"]["chain"][0]["threshold"] == "down <= -25%", r_down
+    assert r_down["data"]["chain"][0]["threshold"] == "down >= 25%", r_down
 
 
 def test_schwartz_classic_no_sex_female_overrate_rejected():

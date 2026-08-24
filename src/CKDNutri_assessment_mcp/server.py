@@ -53,7 +53,7 @@ def assess_clinical_status_tool(
     serum_creatinine_mgdl: float,
     serum_creatinine_unit: Literal["mg_dL", "umol_L"] = "mg_dL",
     is_preterm: bool = False,
-    sex: Literal["M", "F"] | None = None,
+    sex: Literal["M", "F", "male", "female", "男", "女"] | None = None,  # 十八审（2026-08-24，A10）：放宽——core _normalize_sex 已支持全拼/中文，仅 server JSON Schema 过窄会拦在 RPC 入口
     uacr_mg_g: float | None = None,
     upcr_mg_g: float | None = None,
     upcr_mg_mmol: float | None = None,  # M-5（2026-08-16）：UPCR mg/mmol（P1 契约单位），自动 ×8.84 转 mg/g（P4 注释修正：mg/mmol→mg/g 是乘法，此前误写 ÷）

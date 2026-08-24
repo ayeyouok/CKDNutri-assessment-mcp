@@ -47,7 +47,7 @@ def test_eval_rule_threshold_aligned_with_formatter():
     r_down = core._eval_rule(down_rule, {"k": 1.0}, {"k": 2.0})  # -50% → 命中
     assert r_down is not None, "down 趋势应命中"
     assert r_down["threshold"] == core._format_rule_threshold(down_rule), r_down
-    assert r_down["threshold"] == "down <= -30%", r_down
+    assert r_down["threshold"] == "down >= 30%", r_down
 
     up_rule = {"id": "R-y", "type": "trend_pct", "metric": "k",
                "direction": "up", "threshold_pct": 30, "unit": "%"}
