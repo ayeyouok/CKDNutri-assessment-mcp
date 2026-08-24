@@ -325,12 +325,16 @@ def calc_egfr_schwartz(
     # 边界组合（如身高 250cm + scr 0.05）可算出 eGFR 数千被静默分期 G1。生理上
     # 儿童 eGFR 罕见 >200（正常 90-140），超限必为录入错误，拒绝（fail-closed）。
     # F1（2026-08-16，第七轮审查）：eGFR 上限 200→250——200 会误拒正常变异（矮小+
-    # 低肌酐儿童如 3 岁 100cm + scr 0.2 → eGFR≈206，健康儿童高值可达 200+）；250
-    # 以上才是必然的录入错误/单位错配（儿童生理上限 ~230）。
-    if egfr > 250:
+    # 低肌酐儿童如 3 岁 100cm + scr 0.2 → eGFR≈206，健康儿童高值可达 200+）。
+    # 十七审（2026-08-24，A1）：上限 250→300——经典式 ≥13 岁青少年男性 k=0.70、
+    # 高身材（如 180cm）+ 偏瘦/低肌酐（如 0.5 mg/dL）可算出 eGFR≈252，属正常高滤过
+    # 生理范围，250 会将其误拒（False Positive Rejection）；真实单位错配（scr 单位用
+    # µmol/L 当 mg/dL 等）eGFR 偏差达数千倍，远超 300，放宽到 300 漏检风险可忽略。
+    # 同时中性化拒绝文案：不再预设"单位错配"，仅提示核查数据/复核 Scr。
+    if egfr > 300:
         raise ValueError(
-            f"eGFR 计算结果 {egfr:.2f} ml/min/1.73m² 超出儿童生理合理上限（>250），"
-            "通常是身高/肌酐录入错误或单位错配，请核查数据")
+            f"eGFR 计算结果 {egfr:.2f} ml/min/1.73m² 超出儿童生理合理上限（>300），"
+            "请核查录入数据（身高/血肌酐）及单位，复核后重算")
     egfr_rounded = round(egfr, 1)
     # N1 修复（2026-08-13）：**未 round 值判级、round 值展示**——此前 round(egfr,1)
     # 先于分期，89.96→90.0 会在边界翻 G2→G1（DAG 用同一舍入值喂 R-07 同理）。
@@ -896,12 +900,11 @@ def _eval_rule(rule: dict[str, Any], new_labs: dict[str, float],
                 hit = pct <= -rule["threshold_pct"]
         if not hit:
             return None
-        # 生成阈值描述：区间型用 low_pct/high_pct，单阈值型用 threshold_pct
-        if "low_pct" in rule:
-            thresh_str = (f"{direction} [{rule['low_pct']}%, {rule['high_pct']}%)")
-        else:
-            thresh_str = (f">= {rule['threshold_pct']}%" if direction == "up"
-                          else f"<= -{rule['threshold_pct']}%")
+        # 十七审（2026-08-24，A4）：阈值文本统一复用 _format_rule_threshold（单一事实源），
+        # 与 list_rules / explain_verdict 对齐——此前本处手写的单阈值趋势缺方向词
+        # （"<= -30%" 无前缀），而 _format_rule_threshold 输出 "down <= -30%"，下游
+        # threshold 字段前缀不一致。现直接复用，杜绝双份格式化逻辑漂移。
+        thresh_str = _format_rule_threshold(rule)
         return {
             "metric": metric,
             # 2026-08-12（系统性审查，P3）：down 方向 observed 取绝对值——_pct_change
