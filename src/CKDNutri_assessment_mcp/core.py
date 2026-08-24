@@ -598,9 +598,11 @@ def _risk_note(g: str, a: str | None) -> str:
         ("G5D", "A1"): "高", ("G5D", "A2"): "高", ("G5D", "A3"): "高",
     }
     if a is None:
-        # 白蛋白尿未计入：无法按 KDIGO 热图评估，显式提示补充 UACR，绝不捏造低风险。
-        return ("白蛋白尿 A 分期未计入 KDIGO 风险热图（未提供 UACR / 仅提供 UPCR）；"
-                "实际进展风险可能更高，请补充 UACR 后复评。")
+        # 十二审（2026-08-24，#4）：文案修正——系统实现中仅提供 UPCR 时会经
+        # _pcr_to_a() 交叉映射生成 A1/A2/A3 并参与 KDIGO 热图评估，a 仅在既无 UACR
+        # 也无 UPCR 时才为 None。原文案"仅提供 UPCR"会误导临床以为传入的 UPCR 未被评估。
+        return ("白蛋白尿 A 分期未计入 KDIGO 风险热图（未提供尿白蛋白 UACR 或尿蛋白 "
+                "UPCR）；实际进展风险可能更高，请补充 UACR 后复评。")
     tier = _RISK_HEATMAP.get((g, a))
     # P1-4（2026-08-18）：热图兜底 Fail-open 修复——此前 `.get((g,a), "中")` 对未映射
     # 组合静默回退"中风险"（如未来新增 G 档/新 A 档组合时捏造风险结论）；未映射即
@@ -1585,8 +1587,24 @@ def assess_clinical_status(
     # P1-3（2026-08-18，十七审）：未识别指标显式暴露——调用方传入但规则库不认识的
     # 键（如 "potassium" 而非 "k"）此前静默忽略，调用方误以为已评估 → 危急规则漏检
     # 无告警（fail-open）。uacr/upcr/bun 是 DAG 合法非规则指标，排除免误报。
+    # 十二审（2026-08-24，#2）：补齐**全部合法指标键白名单**——_normalize_labs 返回的
+    # normalized_labs 同时含规则短名（k）与原始完整键（k_mmol_L 等别名）。此前 unknown
+    # 只排除 3 个非规则短名，完整别名键（k_mmol_L/hb_g_L/scr_umol_L...）被误判 unknown
+    # → 虚假告警"未识别指标" + fully_evaluable 被错误置 False → assessment_status 从
+    # FULL 误降级 PARTIAL（下游误判数据残缺）。现构建 _ALL_KNOWN_LAB_KEYS（规则短名 ∪
+    # 所有别名映射键 ∪ 非规则短名及其大小写变体），unknown 判定从白名单排除。
+    _ALL_KNOWN_LAB_KEYS = frozenset(
+        set(rule_metrics)
+        | set(_LAB_ALIAS_TO_RULE.keys())
+        | {short for short, _ in _LAB_ALIAS_TO_RULE.values()}
+        | {"uacr", "upcr", "bun"}
+    )
     _KNOWN_NON_RULE = {"uacr", "upcr", "bun"}
-    unknown_metrics = sorted(set(normalized_labs) - set(rule_metrics) - _KNOWN_NON_RULE)
+    unknown_metrics = sorted(
+        k for k in normalized_labs
+        if k not in _ALL_KNOWN_LAB_KEYS
+        and k.lower() not in {ak.lower() for ak in _ALL_KNOWN_LAB_KEYS}
+    )
     risk_completeness["unknown_metrics"] = unknown_metrics
     if unknown_metrics:
         risk_completeness["note"] += (

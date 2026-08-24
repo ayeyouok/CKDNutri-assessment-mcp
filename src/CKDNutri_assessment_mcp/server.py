@@ -51,7 +51,10 @@ def assess_clinical_status_tool(
     age_years: float,
     height_cm: float,
     serum_creatinine_mgdl: float,
-    serum_creatinine_unit: Literal["mg_dL", "umol_L"] = "mg_dL",
+    # 十二审（2026-08-24，#5）：serum_creatinine_unit 放宽——core._normalize_unit 已
+    # 兼容 "mg/dl"/"umol/L"/"MG_DL" 等大小写/分隔符变体，server 端 Literal 过严会在
+    # RPC 入口 Pydantic 拦截合法变体（INVALID_INPUT）。放宽为 str | None，清洗交由 core。
+    serum_creatinine_unit: str | None = "mg_dL",
     is_preterm: bool = False,
     sex: Literal["M", "F", "male", "female", "男", "女"] | None = None,  # 十八审（2026-08-24，A10）：放宽——core _normalize_sex 已支持全拼/中文，仅 server JSON Schema 过窄会拦在 RPC 入口
     uacr_mg_g: float | None = None,
